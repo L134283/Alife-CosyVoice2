@@ -13,12 +13,12 @@
   "tags": [
     "语音模型"
   ],
-  "source": "",
+  "source": "https://github.com/L134283/Alife-CosyVoice2",
   "releases": {
     "1.1.0": {
       "date": "2026-07-12",
       "note": "端口探测修复未观察 Socket 异常；日志改为纯中文 Console 输出（无 info: Class[0] 前缀）；风格指令留空用默认语气；启动/守护/清理与预热稳定性增强；配置 UI 重做为「Cosy 星语」粉紫流光主题（声波动画、Mode/AutoStart 芯片、折叠高级项）",
-      "file": "https://github.com/L134283/Alife-CosyVoice2/releases/download/1.1.0/Alife.Function.Speech.CosyVoiceTTS.zip",
+      "file": "https://github.com/L134283/Alife-CosyVoice2/releases/download/CosyVoice2-v1.1.0/Alife.Function.Speech.CosyVoice2.zip",
       "dependencies": null,
       "environments": null
     },
