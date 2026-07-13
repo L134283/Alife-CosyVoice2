@@ -31,7 +31,14 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         public CosyVoiceSpeechModelConfig? Configuration { get; set; }
 
         private static readonly ConcurrentDictionary<string, string> FileCache = new();
-        private static readonly ConcurrentDictionary<string, Task<string?>> InFlight = new();
+        private static readonly ConcurrentDictionary<string, InFlightSynth> InFlight = new();
+
+        /// <summary>同句飞行合成：带等待方计数，无人等待时停止重试。</summary>
+        private sealed class InFlightSynth
+        {
+            public Task<string?> Task = null!;
+            public int Waiters;
+        }
 
         // 超时由每次请求的 CancelAfter 控制
         private readonly HttpClient _http = new()
@@ -43,11 +50,19 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private CancellationTokenSource? _watchdogCts;
         private Task? _watchdogTask;
         private readonly SemaphoreSlim _startLock = new(1, 1);
+        // 本地 Cosy 服务通常单路推理；并发会打出大量 500
+        private readonly SemaphoreSlim _synthLock = new(1, 1);
+        private int _activeSynth;
+        private long _lastSynthUtcTicks = DateTime.UtcNow.Ticks;
         private volatile bool _ready;
         private string[] _speakers = Array.Empty<string>();
 
         public IReadOnlyList<string> Speakers => _speakers;
         public bool IsReady => _ready;
+
+        private bool IsBusySynthesizing => Volatile.Read(ref _activeSynth) > 0;
+        private bool RecentlySynthesized(TimeSpan window)
+            => (DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastSynthUtcTicks), DateTimeKind.Utc)) < window;
 
         // 用 Console 输出，避免 ILogger 默认的 info: Namespace.Class[0] 前缀
         private static void Log(string msg) => Console.WriteLine($"[Cosy语音] {msg}");
@@ -145,6 +160,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 _host?.Stop();
                 _http.Dispose();
                 _startLock.Dispose();
+                _synthLock.Dispose();
                 _watchdogCts?.Dispose();
             }
             catch (Exception ex)
@@ -168,6 +184,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             NormalizeApiUrl();
 
             text = text.Trim();
+            // Cosy 对纯标点/空白会稳定 500，合成前直接跳过
+            if (!HasSpeakableContent(text))
+            {
+                LogWarn($"跳过不可朗读文本：「{Truncate(text, 40)}」");
+                return null;
+            }
+
             string spkid = string.IsNullOrWhiteSpace(Configuration.ReferenceAudio)
                 ? "女主持"
                 : Configuration.ReferenceAudio.Trim();
@@ -184,19 +207,31 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 return cached;
 
             // 同句飞行去重：并发相同文本只打一次 API
-            var task = InFlight.GetOrAdd(hash, _ =>
-                SynthesizeAndUntrackAsync(hash, text, spkid, speed, instruct, outputPath));
+            var entry = InFlight.GetOrAdd(hash, _ =>
+            {
+                var e = new InFlightSynth();
+                e.Task = SynthesizeAndUntrackAsync(hash, text, spkid, speed, instruct, outputPath, e);
+                return e;
+            });
 
-            if (!cancellationToken.CanBeCanceled)
-                return await task.ConfigureAwait(false);
+            Interlocked.Increment(ref entry.Waiters);
+            try
+            {
+                if (!cancellationToken.CanBeCanceled)
+                    return await entry.Task.ConfigureAwait(false);
 
-            // 调用方可取消等待，但不取消已在飞的合成
-            var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            await using var reg = cancellationToken.Register(() => cancelTcs.TrySetResult());
-            var finished = await Task.WhenAny(task, cancelTcs.Task).ConfigureAwait(false);
-            if (finished != task)
-                throw new OperationCanceledException(cancellationToken);
-            return await task.ConfigureAwait(false);
+                // 调用方可取消等待；无人等待时后台停止重试
+                var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                await using var reg = cancellationToken.Register(() => cancelTcs.TrySetResult());
+                var finished = await Task.WhenAny(entry.Task, cancelTcs.Task).ConfigureAwait(false);
+                if (finished != entry.Task)
+                    throw new OperationCanceledException(cancellationToken);
+                return await entry.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref entry.Waiters);
+            }
         }
 
         private async Task<string?> SynthesizeAndUntrackAsync(
@@ -205,12 +240,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             string spkid,
             float speed,
             string instruct,
-            string outputPath)
+            string outputPath,
+            InFlightSynth entry)
         {
             try
             {
                 return await SynthesizeCoreAsync(
-                    text, spkid, speed, instruct, outputPath, hash, CancellationToken.None)
+                    text, spkid, speed, instruct, outputPath, hash, entry, CancellationToken.None)
                     .ConfigureAwait(false);
             }
             finally
@@ -226,6 +262,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             string instruct,
             string outputPath,
             string hash,
+            InFlightSynth entry,
             CancellationToken cancellationToken)
         {
             if (!_ready)
@@ -241,89 +278,141 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 : new { text, spkid, speed, instruct, stream = false };
 
             string url = Configuration!.ApiUrl.TrimEnd('/') + "/tts";
-            int maxRetry = 8;
+            // 真忙重试次数收紧；不可朗读文本不会进到这里
+            int maxRetry = 4;
             int timeoutSec = Math.Max(10, Configuration.RequestTimeoutSeconds);
             HttpResponseMessage? resp = null;
 
-            for (int retry = 0; retry < maxRetry; retry++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                using var content = new StringContent(
-                    JsonSerializer.Serialize(payload),
-                    Encoding.UTF8,
-                    "application/json");
-
-                try
-                {
-                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSec));
-
-                    resp = await _http.PostAsync(url, content, timeoutCts.Token)
-                        .ConfigureAwait(false);
-
-                    if (resp.IsSuccessStatusCode)
-                        break;
-
-                    string body = await resp.Content.ReadAsStringAsync(cancellationToken)
-                        .ConfigureAwait(false);
-                    LogWarn($"合成请求失败（{(int)resp.StatusCode}），{Truncate(body, 120)}");
-
-                    // 4xx 参数问题不重试
-                    if ((int)resp.StatusCode is >= 400 and < 500 and not 408 and not 429)
-                    {
-                        resp.Dispose();
-                        return null;
-                    }
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (
-                    ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
-                {
-                    if (retry == 0)
-                        Log("服务未就绪，等待中…");
-                    else if (retry % 3 == 0)
-                        Log($"仍在等待服务（{retry + 1}/{maxRetry}）");
-                }
-
-                resp?.Dispose();
-                resp = null;
-
-                int waitMs = Math.Min(10_000, 1000 * (1 << Math.Min(retry, 3)));
-                await Task.Delay(waitMs, cancellationToken).ConfigureAwait(false);
-            }
-
-            if (resp == null || !resp.IsSuccessStatusCode)
-            {
-                LogError($"合成失败，已重试 {maxRetry} 次");
-                resp?.Dispose();
-                return null;
-            }
-
+            Interlocked.Increment(ref _activeSynth);
+            Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
+            // 串行化请求，避免本地服务并发 500
+            await _synthLock.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                byte[] audio = await resp.Content.ReadAsByteArrayAsync(cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (audio.Length < 44)
+                for (int retry = 0; retry < maxRetry; retry++)
                 {
-                    LogError($"返回音频过短（{audio.Length} 字节）");
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // 首次请求照常；之后若已无人等待则停止重试
+                    if (retry > 0 && Volatile.Read(ref entry.Waiters) <= 0)
+                    {
+                        Log("合成等待已取消，停止重试");
+                        resp?.Dispose();
+                        return null;
+                    }
+
+                    Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
+
+                    using var content = new StringContent(
+                        JsonSerializer.Serialize(payload),
+                        Encoding.UTF8,
+                        "application/json");
+
+                    try
+                    {
+                        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSec));
+
+                        resp = await _http.PostAsync(url, content, timeoutCts.Token)
+                            .ConfigureAwait(false);
+
+                        if (resp.IsSuccessStatusCode)
+                            break;
+
+                        int code = (int)resp.StatusCode;
+                        string body = await resp.Content.ReadAsStringAsync(cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (code >= 500)
+                        {
+                            // 空 body + 几乎无有效字符：服务端拒读，重试无意义
+                            if (IsNonRetryableServerError(code, body, text))
+                            {
+                                LogWarn(
+                                    $"合成拒绝（{code}），文本不可朗读：「{Truncate(text, 40)}」" +
+                                    (string.IsNullOrWhiteSpace(body) ? "" : $" {Truncate(body, 80)}"));
+                                resp.Dispose();
+                                return null;
+                            }
+
+                            if (retry == 0 || retry % 2 == 0)
+                                LogWarn($"合成服务忙（{code}），文本「{Truncate(text, 40)}」，稍后重试…");
+                        }
+                        else
+                        {
+                            LogWarn($"合成请求失败（{code}），文本「{Truncate(text, 40)}」，{Truncate(body, 120)}");
+                        }
+
+                        // 4xx 参数问题不重试（408/429 除外）
+                        if (code is >= 400 and < 500 and not 408 and not 429)
+                        {
+                            resp.Dispose();
+                            return null;
+                        }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex) when (
+                        ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
+                    {
+                        if (retry == 0)
+                            Log("服务未就绪，等待中…");
+                        else if (retry % 2 == 0)
+                            Log($"仍在等待服务（{retry + 1}/{maxRetry}）");
+                    }
+
+                    resp?.Dispose();
+                    resp = null;
+
+                    // 5xx 短退避；无人等待则不再等
+                    if (Volatile.Read(ref entry.Waiters) <= 0)
+                    {
+                        Log("合成等待已取消，停止重试");
+                        return null;
+                    }
+
+                    int waitMs = Math.Min(8_000, 800 * (1 << Math.Min(retry, 3)));
+                    await Task.Delay(waitMs, cancellationToken).ConfigureAwait(false);
+                }
+
+                if (resp == null || !resp.IsSuccessStatusCode)
+                {
+                    LogError($"合成失败，已重试 {maxRetry} 次，文本「{Truncate(text, 40)}」");
+                    resp?.Dispose();
                     return null;
                 }
 
-                string tmp = outputPath + ".tmp";
-                await File.WriteAllBytesAsync(tmp, audio, cancellationToken).ConfigureAwait(false);
-                File.Move(tmp, outputPath, overwrite: true);
+                try
+                {
+                    byte[] audio = await resp.Content.ReadAsByteArrayAsync(cancellationToken)
+                        .ConfigureAwait(false);
 
-                FileCache[hash] = outputPath;
-                return outputPath;
+                    if (audio.Length < 44)
+                    {
+                        LogError($"返回音频过短（{audio.Length} 字节），文本「{Truncate(text, 40)}」");
+                        return null;
+                    }
+
+                    string tmp = outputPath + ".tmp";
+                    await File.WriteAllBytesAsync(tmp, audio, cancellationToken).ConfigureAwait(false);
+                    File.Move(tmp, outputPath, overwrite: true);
+
+                    FileCache[hash] = outputPath;
+                    Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
+                    return outputPath;
+                }
+                finally
+                {
+                    resp.Dispose();
+                }
             }
             finally
             {
-                resp.Dispose();
+                _synthLock.Release();
+                Interlocked.Decrement(ref _activeSynth);
+                Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
             }
         }
 
@@ -344,7 +433,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                 while (!ct.IsCancellationRequested)
                 {
-                    int delaySec = (DateTime.UtcNow - started).TotalMinutes < 2 ? 8 : 20;
+                    int delaySec = (DateTime.UtcNow - started).TotalMinutes < 2 ? 10 : 25;
                     try
                     {
                         await Task.Delay(TimeSpan.FromSeconds(delaySec), ct).ConfigureAwait(false);
@@ -356,6 +445,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                     try
                     {
+                        // 正在合成 / 刚合成完：服务可能暂时不响应健康检查，禁止误杀
+                        if (IsBusySynthesizing || RecentlySynthesized(TimeSpan.FromSeconds(45)))
+                        {
+                            failStreak = 0;
+                            continue;
+                        }
+
                         bool ok = await HealthCheckAsync(ct).ConfigureAwait(false);
                         if (ok)
                         {
@@ -366,22 +462,43 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                             continue;
                         }
 
-                        failStreak++;
-                        _ready = false;
+                        // 合成中途失败不累计（双重保险）
+                        if (IsBusySynthesizing)
+                        {
+                            failStreak = 0;
+                            continue;
+                        }
 
-                        // 连续失败才打日志，避免刷屏
+                        failStreak++;
+                        // 忙时偶发失败不立刻标未就绪，避免上层连环重试
+                        if (failStreak >= 2)
+                            _ready = false;
+
                         if (failStreak == 1 || failStreak % 3 == 0)
                             LogWarn($"健康检查失败（连续 {failStreak} 次）");
 
-                        int threshold = Math.Max(3, Configuration?.RestartAfterFailures ?? 6);
+                        // 提高重启门槛，避免 500 抖动时杀进程
+                        int threshold = Math.Max(8, Configuration?.RestartAfterFailures ?? 8);
                         if (failStreak >= threshold && (Configuration?.AutoStart ?? true) && _host != null)
                         {
+                            // 重启前再确认：若又开始合成则取消重启
+                            if (IsBusySynthesizing || RecentlySynthesized(TimeSpan.FromSeconds(30)))
+                            {
+                                failStreak = 0;
+                                continue;
+                            }
+
                             LogWarn("连续失败，正在重启服务…");
                             await _startLock.WaitAsync(ct).ConfigureAwait(false);
                             try
                             {
+                                if (IsBusySynthesizing)
+                                {
+                                    failStreak = 0;
+                                    continue;
+                                }
                                 _host.ForceCleanup();
-                                await Task.Delay(1500, ct).ConfigureAwait(false);
+                                await Task.Delay(2000, ct).ConfigureAwait(false);
                                 _host.Start();
                             }
                             finally
@@ -397,8 +514,11 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     }
                     catch (Exception ex)
                     {
-                        failStreak++;
-                        LogWarn($"健康检查异常：{ex.Message}");
+                        if (!IsBusySynthesizing)
+                        {
+                            failStreak++;
+                            LogWarn($"健康检查异常：{ex.Message}");
+                        }
                     }
                 }
             }, ct);
@@ -406,10 +526,15 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         private async Task<bool> HealthCheckAsync(CancellationToken ct = default)
         {
+            // 合成占用时健康检查易超时/失败，直接视为暂态 OK
+            if (IsBusySynthesizing)
+                return true;
+
             try
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+                // 忙后恢复期给更长超时
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(8));
 
                 string url = Configuration!.ApiUrl.TrimEnd('/') + "/get_spk";
                 using var resp = await _http.GetAsync(url, timeoutCts.Token).ConfigureAwait(false);
@@ -562,6 +687,47 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             using var md5 = MD5.Create();
             var raw = $"{text}|{spkid}|{speed:F2}|{instruct}|{api}";
             return Convert.ToHexString(md5.ComputeHash(Encoding.UTF8.GetBytes(raw)));
+        }
+
+        /// <summary>
+        /// 是否含可朗读内容（字母/数字/CJK 等）。纯标点、省略号、空白会让 Cosy 返回 500。
+        /// </summary>
+        private static bool HasSpeakableContent(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+
+            foreach (var c in text)
+            {
+                if (char.IsLetterOrDigit(c))
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 5xx 且像「文本拒读」而非「服务忙」：空 body + 文本几乎无可读字符 → 不重试。
+        /// </summary>
+        private static bool IsNonRetryableServerError(int code, string body, string text)
+        {
+            if (code < 500)
+                return false;
+            if (!HasSpeakableContent(text))
+                return true;
+            // 极短且 body 为空时，多为服务端对异常输入直接炸了
+            if (string.IsNullOrWhiteSpace(body) && text.Length <= 4)
+            {
+                int speakable = 0;
+                foreach (var c in text)
+                {
+                    if (char.IsLetterOrDigit(c))
+                        speakable++;
+                }
+                if (speakable == 0)
+                    return true;
+            }
+            return false;
         }
 
         private static string Truncate(string s, int max)

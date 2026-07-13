@@ -15,6 +15,13 @@
   ],
   "source": "https://github.com/L134283/Alife-CosyVoice2",
   "releases": {
+    "1.1.1": {
+      "date": "2026-07-14",
+      "note": "合成前过滤纯标点/空白等不可朗读文本，避免 Cosy 稳定 500；500 分类（拒读不重试 / 真忙短退避）；无人等待时停止 InFlight 重试；失败日志带截断原文",
+      "file": "https://github.com/L134283/Alife-CosyVoice2/releases/download/CosyVoice2-v1.1.1/Alife.Function.Speech.CosyVoice2.zip",
+      "dependencies": null,
+      "environments": null
+    },
     "1.1.0": {
       "date": "2026-07-12",
       "note": "端口探测修复未观察 Socket 异常；日志改为纯中文 Console 输出（无 info: Class[0] 前缀）；风格指令留空用默认语气；启动/守护/清理与预热稳定性增强；配置 UI 重做为「Cosy 星语」粉紫流光主题（声波动画、Mode/AutoStart 芯片、折叠高级项）",
