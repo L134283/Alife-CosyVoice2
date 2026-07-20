@@ -2,7 +2,7 @@
   "id": "Alife.Function.Speech.CosyVoice2",
   "name": "CosyVoice2语音合成",
   "author": "doro",
-  "description": "基于本地 CosyVoice2 (yinmei) 的语音合成插件：自动启动与守护、音色/语速/风格指令、健康检查与残留清理、干净中文日志。",
+  "description": "基于本地 CosyVoice2 (yinmei) 的语音合成插件：多桌宠共享同一 TTS 进程、自动启动与守护、音色/语速/风格指令、健康检查与残留清理、干净中文日志。",
   "dependencies": {
     "Alife.Function.Speech": ""
   },
@@ -15,6 +15,13 @@
   ],
   "source": "https://github.com/L134283/Alife-CosyVoice2",
   "releases": {
+    "1.2.0": {
+      "date": "2026-07-21",
+      "note": "多桌宠共享同一 TTS 进程（SharedService 默认开）：跨进程启动互斥/合成串行、退出仅最后客户端停服、共享模式不绑 KillOnClose Job、看门狗不误杀其它桌宠在用的服务；TTS 连败检测 + CUDA 上下文损坏自动重启；死进程阻塞启动时自动清理残留并重起；OMP/MKL 线程限制稳延迟",
+      "file": "https://github.com/L134283/Alife-CosyVoice2/releases/download/CosyVoice2-v1.2.0/Alife.Function.Speech.CosyVoice2.zip",
+      "dependencies": null,
+      "environments": null
+    },
     "1.1.1": {
       "date": "2026-07-14",
       "note": "合成前过滤纯标点/空白等不可朗读文本，避免 Cosy 稳定 500；500 分类（拒读不重试 / 真忙短退避）；无人等待时停止 InFlight 重试；失败日志带截断原文",

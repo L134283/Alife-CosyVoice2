@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -47,19 +47,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         };
 
         private CosyVoiceServiceHost? _host;
+        private CosyVoiceSharedGate? _gate;
         private CancellationTokenSource? _watchdogCts;
         private Task? _watchdogTask;
         private readonly SemaphoreSlim _startLock = new(1, 1);
-        // 本地 Cosy 服务通常单路推理；并发会打出大量 500
+        // 进程内串行；跨进程由 Named Mutex 再串一层
         private readonly SemaphoreSlim _synthLock = new(1, 1);
         private int _activeSynth;
         private long _lastSynthUtcTicks = DateTime.UtcNow.Ticks;
         private volatile bool _ready;
+        private volatile bool _ownsProcess;
+        private int _ttsFailStreak;
         private string[] _speakers = Array.Empty<string>();
 
         public IReadOnlyList<string> Speakers => _speakers;
         public bool IsReady => _ready;
 
+        private bool Shared => Configuration?.SharedService ?? true;
         private bool IsBusySynthesizing => Volatile.Read(ref _activeSynth) > 0;
         private bool RecentlySynthesized(TimeSpan window)
             => (DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastSynthUtcTicks), DateTimeKind.Utc)) < window;
@@ -77,12 +81,17 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             NormalizeApiUrl();
 
             _host = new CosyVoiceServiceHost(Configuration);
+            _gate = new CosyVoiceSharedGate(Configuration.Port, Configuration.ProjectDir);
+            _gate.RegisterClient();
+            if (Shared)
+                Log($"共享模式：客户端 {_gate.CountLiveClients()} 个，端口 {Configuration.Port}");
 
             // 仅当健康检查通过才复用；端口占用但不健康会在 Start 里强制清理
             if (await ProbeReadyAsync(TimeSpan.FromSeconds(2)))
             {
                 Log("检测到已有服务，复用中");
                 _ready = true;
+                _ownsProcess = false;
                 EnsureValidSpeaker();
                 await WarmupAsync();
                 StartWatchdog();
@@ -108,12 +117,26 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 await _startLock.WaitAsync();
                 try
                 {
-                    if (!await ProbeReadyAsync(TimeSpan.FromSeconds(1)))
+                    // 跨进程启动锁：双桌宠同时 AutoStart 时只起一个 Python
+                    using var startHold = _gate.TryAcquireStart(TimeSpan.FromSeconds(90));
+                    if (startHold == null)
+                    {
+                        // 未拿到启动锁：禁止 ForceCleanup，避免杀掉对方正在拉起的进程
+                        LogWarn("等待其他客户端启动服务超时，改为探测复用");
+                        _ownsProcess = false;
+                    }
+                    else if (!await ProbeReadyAsync(TimeSpan.FromSeconds(1)))
                     {
                         // 健康失败时强制清理残留（含异常退出留下的 Python），再启动
                         _host.ForceCleanup();
-                        _host.Start();
-                        Log("服务启动中…");
+                        _host.Start(bindJob: !Shared);
+                        _ownsProcess = true;
+                        Log(Shared ? "服务启动中…（共享，不绑定退出杀进程）" : "服务启动中…");
+                    }
+                    else
+                    {
+                        Log("其他客户端已拉起服务，复用中");
+                        _ownsProcess = false;
                     }
                 }
                 finally
@@ -133,7 +156,44 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 }
                 else
                 {
-                    LogWarn($"{Configuration.ReadyTimeoutSeconds} 秒内未就绪，后续请求将继续重试");
+                    bool procAlive = _host?.IsProcessAlive == true;
+                    bool portUp = CosyVoiceServiceHost.IsPortInUse(Configuration.Port);
+
+                    // 进程已死 → 清理残留（PID 文件 / 僵尸端口）并自动重起一次
+                    if (!procAlive && (Configuration?.AutoStart ?? true) && _host != null)
+                    {
+                        LogWarn("服务进程已退出，清理残留并自动重启…");
+                        _host.ForceCleanup();
+                        await Task.Delay(1000).ConfigureAwait(false);
+                        _host.Start(bindJob: !Shared);
+                        _ownsProcess = true;
+
+                        ok = await WaitUntilReadyAsync(
+                            TimeSpan.FromSeconds(Math.Max(30, Configuration.ReadyTimeoutSeconds)));
+                        if (ok)
+                        {
+                            _ready = true;
+                            EnsureValidSpeaker();
+                            await WarmupAsync();
+                            Log($"服务就绪（重启后），音色 {_speakers.Length} 个");
+                        }
+                        else
+                        {
+                            procAlive = _host?.IsProcessAlive == true;
+                            portUp = CosyVoiceServiceHost.IsPortInUse(Configuration.Port);
+                            LogWarn(
+                                $"{Configuration.ReadyTimeoutSeconds} 秒内未就绪" +
+                                $"（进程={(procAlive ? "在" : "已退出")}，端口{Configuration.Port}={(portUp ? "监听中" : "未监听")}），" +
+                                "请查看 [Cosy语音] 进程异常退出日志以及 ComfyUI 显存设置");
+                        }
+                    }
+                    else
+                    {
+                        LogWarn(
+                            $"{Configuration.ReadyTimeoutSeconds} 秒内未就绪" +
+                            $"（进程={(procAlive ? "在" : "已退出")}，端口{Configuration.Port}={(portUp ? "监听中" : "未监听")}），" +
+                            "后续请求将继续重试；请查看 [Cosy语音] 进程异常退出日志");
+                    }
                 }
             }
             catch (Exception ex)
@@ -156,8 +216,30 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     catch { /* ignore */ }
                 }
 
-                // 正常退出：停掉本插件拉起的服务，释放显存/内存
-                _host?.Stop();
+                int remaining = _gate?.UnregisterClient() ?? 0;
+
+                if (Shared)
+                {
+                    // 共享模式：仅最后一位存活客户端停服，避免关掉一个桌宠带走 TTS
+                    if (remaining <= 0)
+                    {
+                        Log("共享模式：已无其他客户端，停止服务");
+                        _host?.Stop();
+                    }
+                    else
+                    {
+                        Log($"共享模式：仍有 {remaining} 个客户端，保留 TTS 进程");
+                        _host?.Detach();
+                    }
+                }
+                else
+                {
+                    // 独占模式：正常退出停掉本插件拉起的服务
+                    _host?.Stop();
+                }
+
+                _gate?.Dispose();
+                _gate = null;
                 _http.Dispose();
                 _startLock.Dispose();
                 _synthLock.Dispose();
@@ -271,6 +353,12 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     TimeSpan.FromSeconds(Math.Min(60, Configuration!.ReadyTimeoutSeconds)),
                     cancellationToken);
                 if (ok) _ready = true;
+                else
+                {
+                    // 健康检查不过时不要再占满合成锁长时间空转
+                    LogWarn($"服务未就绪，放弃合成：「{Truncate(text, 40)}」");
+                    return null;
+                }
             }
 
             object payload = string.IsNullOrEmpty(instruct)
@@ -279,16 +367,24 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             string url = Configuration!.ApiUrl.TrimEnd('/') + "/tts";
             // 真忙重试次数收紧；不可朗读文本不会进到这里
-            int maxRetry = 4;
-            int timeoutSec = Math.Max(10, Configuration.RequestTimeoutSeconds);
+            // 与 ComfyUI 等同卡 GPU 时，过长重试会让桌宠「一直卡住不出声」
+            int maxRetry = 3;
+            int timeoutSec = Math.Clamp(Configuration.RequestTimeoutSeconds, 10, 90);
             HttpResponseMessage? resp = null;
 
             Interlocked.Increment(ref _activeSynth);
             Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
-            // 串行化请求，避免本地服务并发 500
+            // 进程内串行 + 跨进程 Named Mutex，避免双桌宠并发打爆本地 Cosy
             await _synthLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            IDisposable? crossProcHold = null;
             try
             {
+                if (Shared && _gate != null)
+                {
+                    crossProcHold = await _gate.AcquireSynthAsync(cancellationToken).ConfigureAwait(false);
+                    Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
+                }
+
                 for (int retry = 0; retry < maxRetry; retry++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -357,10 +453,16 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     catch (Exception ex) when (
                         ex is HttpRequestException or TaskCanceledException or OperationCanceledException)
                     {
+                        // TaskCanceledException 多数是单次 HTTP 超时（GPU 被 Comfy 占满时常见）
+                        bool isTimeout = ex is TaskCanceledException && !cancellationToken.IsCancellationRequested;
                         if (retry == 0)
-                            Log("服务未就绪，等待中…");
+                            Log(isTimeout
+                                ? $"合成超时（{timeoutSec}s），可能 GPU/CPU 被其它任务占用，稍后重试…"
+                                : "服务未就绪，等待中…");
                         else if (retry % 2 == 0)
-                            Log($"仍在等待服务（{retry + 1}/{maxRetry}）");
+                            Log(isTimeout
+                                ? $"合成仍超时（{retry + 1}/{maxRetry}）"
+                                : $"仍在等待服务（{retry + 1}/{maxRetry}）");
                     }
 
                     resp?.Dispose();
@@ -379,6 +481,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                 if (resp == null || !resp.IsSuccessStatusCode)
                 {
+                    Interlocked.Increment(ref _ttsFailStreak);
+                    LogWarn($"TTS 连续失败 {Volatile.Read(ref _ttsFailStreak)} 次，可能 CUDA 上下文已损坏");
                     LogError($"合成失败，已重试 {maxRetry} 次，文本「{Truncate(text, 40)}」");
                     resp?.Dispose();
                     return null;
@@ -401,6 +505,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                     FileCache[hash] = outputPath;
                     Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
+                    Interlocked.Exchange(ref _ttsFailStreak, 0);
                     return outputPath;
                 }
                 finally
@@ -410,6 +515,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
             finally
             {
+                try { crossProcHold?.Dispose(); } catch { /* ignore */ }
                 _synthLock.Release();
                 Interlocked.Decrement(ref _activeSynth);
                 Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
@@ -445,8 +551,14 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                     try
                     {
-                        // 正在合成 / 刚合成完：服务可能暂时不响应健康检查，禁止误杀
-                        if (IsBusySynthesizing || RecentlySynthesized(TimeSpan.FromSeconds(45)))
+                        // 共享模式心跳：避免其它桌宠误判本端已退出
+                        if (Shared)
+                            _gate?.RegisterClient();
+
+                        // 本进程或其它桌宠正在合成 / 刚合成完：禁止误杀
+                        if (IsBusySynthesizing ||
+                            RecentlySynthesized(TimeSpan.FromSeconds(45)) ||
+                            (_gate?.IsSynthBusyElsewhere() ?? false))
                         {
                             failStreak = 0;
                             continue;
@@ -459,11 +571,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                                 Log("服务已恢复");
                             _ready = true;
                             failStreak = 0;
-                            continue;
+
+                            // 即使 /get_spk 通过，TTS 连续失败也可能标识 CUDA 已损坏
+                            int ttsFails = Volatile.Read(ref _ttsFailStreak);
+                            if (ttsFails >= 3)
+                            {
+                                LogWarn($"TTS 连续失败 {ttsFails} 次，可能 CUDA 上下文已损坏，触发重启");
+                                _ready = false;
+                                failStreak = Math.Max(8, Configuration?.RestartAfterFailures ?? 8) + 1;
+                            }
+                            else
+                            {
+                                continue;
+                            }
                         }
 
                         // 合成中途失败不累计（双重保险）
-                        if (IsBusySynthesizing)
+                        if (IsBusySynthesizing || (_gate?.IsSynthBusyElsewhere() ?? false))
                         {
                             failStreak = 0;
                             continue;
@@ -481,10 +605,20 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         int threshold = Math.Max(8, Configuration?.RestartAfterFailures ?? 8);
                         if (failStreak >= threshold && (Configuration?.AutoStart ?? true) && _host != null)
                         {
-                            // 重启前再确认：若又开始合成则取消重启
-                            if (IsBusySynthesizing || RecentlySynthesized(TimeSpan.FromSeconds(30)))
+                            // 重启前再确认：若又开始合成 / 其它客户端仍在用则取消重启
+                            if (IsBusySynthesizing ||
+                                RecentlySynthesized(TimeSpan.FromSeconds(30)) ||
+                                (_gate?.IsSynthBusyElsewhere() ?? false))
                             {
                                 failStreak = 0;
+                                continue;
+                            }
+
+                            // 共享模式：仅当本机是最后存活客户端时才允许杀进程重启
+                            if (Shared && (_gate?.CountLiveClients() ?? 1) > 1)
+                            {
+                                if (failStreak == threshold || failStreak % 6 == 0)
+                                    LogWarn("共享模式：其它桌宠仍在使用，跳过重启以免打断对方");
                                 continue;
                             }
 
@@ -492,14 +626,31 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                             await _startLock.WaitAsync(ct).ConfigureAwait(false);
                             try
                             {
-                                if (IsBusySynthesizing)
+                                if (IsBusySynthesizing || (_gate?.IsSynthBusyElsewhere() ?? false))
                                 {
                                     failStreak = 0;
                                     continue;
                                 }
+
+                                using var startHold = _gate?.TryAcquireStart(TimeSpan.FromSeconds(15));
+                                if (Shared && startHold == null)
+                                {
+                                    LogWarn("共享模式：其它客户端正在启动/重启，本端跳过");
+                                    failStreak = 0;
+                                    continue;
+                                }
+
+                                if (await HealthCheckAsync(ct).ConfigureAwait(false))
+                                {
+                                    _ready = true;
+                                    failStreak = 0;
+                                    continue;
+                                }
+
                                 _host.ForceCleanup();
                                 await Task.Delay(2000, ct).ConfigureAwait(false);
-                                _host.Start();
+                                _host.Start(bindJob: !Shared);
+                                _ownsProcess = true;
                             }
                             finally
                             {
@@ -740,8 +891,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
     /// <summary>
     /// 管理本地 CosyVoice Python 进程。
-    /// - 正常退出：Stop 杀进程树
-    /// - 异常退出：Windows Job（KILL_ON_JOB_CLOSE）随主进程一起带走子进程
+    /// - 独占模式：Stop 杀进程树；Windows Job（KILL_ON_JOB_CLOSE）随主进程带走子进程
+    /// - 共享模式：不绑 Job；Detach 仅放弃句柄；Stop 仅在最后客户端调用
     /// - 历史残留：ForceCleanup 按 PID 文件 + 端口双通道清理
     /// </summary>
     public class CosyVoiceServiceHost
@@ -763,7 +914,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             _config = config;
         }
 
-        public void Start()
+        /// <summary>本实例是否仍持有存活的 Python 进程句柄。</summary>
+        public bool IsProcessAlive
+        {
+            get
+            {
+                try { return _process != null && !_process.HasExited; }
+                catch { return false; }
+            }
+        }
+
+        /// <summary>端口是否处于 LISTENING（供就绪诊断）。</summary>
+        public static bool IsPortInUse(int port) => IsPortListening(port);
+
+        /// <param name="bindJob">
+        /// true=绑定 KillOnClose Job（独占）；false=共享模式不绑，避免一个桌宠退出带走 TTS。
+        /// </param>
+        public void Start(bool bindJob = true)
         {
             if (_process != null && !_process.HasExited)
                 return;
@@ -798,7 +965,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     $"--mode {mode}";
 
                 _stderr.Clear();
-                EnsureJobObject();
+                if (bindJob)
+                    EnsureJobObject();
+                else
+                    CloseJobObject();
 
                 _process = new Process
                 {
@@ -818,6 +988,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 _process.StartInfo.Environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True";
                 _process.StartInfo.Environment["PYTHONUNBUFFERED"] = "1";
                 _process.StartInfo.Environment["PYTHONIOENCODING"] = "utf-8";
+                // 稳延迟：限制 CPU 线程争抢，不伤 GPU 推理主路径
+                _process.StartInfo.Environment["OMP_NUM_THREADS"] = "4";
+                _process.StartInfo.Environment["MKL_NUM_THREADS"] = "4";
+                // 与 start.bat 一致：把项目自带 ffmpeg 放进 PATH，避免部分音频处理失败
+                try
+                {
+                    string ffmpegDir = Path.Combine(_config.ProjectDir, "ffmpeg");
+                    if (Directory.Exists(ffmpegDir))
+                    {
+                        string pathEnv = _process.StartInfo.Environment.TryGetValue("PATH", out var existing)
+                            ? existing ?? ""
+                            : (Environment.GetEnvironmentVariable("PATH") ?? "");
+                        if (pathEnv.IndexOf(ffmpegDir, StringComparison.OrdinalIgnoreCase) < 0)
+                            _process.StartInfo.Environment["PATH"] = ffmpegDir + Path.PathSeparator + pathEnv;
+                    }
+                }
+                catch { /* ignore */ }
 
                 // 不刷 stdout/stderr 到日志；仅缓存 stderr 供异常退出时摘要
                 _process.OutputDataReceived += (_, _) => { };
@@ -854,15 +1041,17 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     _process.BeginOutputReadLine();
                     _process.BeginErrorReadLine();
 
-                    // 纳入 Job：Alife 异常退出时一并杀掉 Python，释放显存/内存
-                    if (_jobHandle != IntPtr.Zero)
+                    // 独占模式才绑 Job：Alife 异常退出时一并杀掉 Python
+                    if (bindJob && _jobHandle != IntPtr.Zero)
                     {
                         if (!WindowsJob.Assign(_jobHandle, _process))
                             LogWarn("无法绑定进程组，异常退出时可能残留服务");
                     }
 
                     File.WriteAllText(PidFilePath, _process.Id.ToString());
-                    Log($"已启动（模式 {mode}）");
+                    Log(bindJob
+                        ? $"已启动（模式 {mode}，独占）"
+                        : $"已启动（模式 {mode}，共享）");
                 }
                 catch (Exception ex)
                 {
@@ -871,6 +1060,29 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     _process?.Dispose();
                     _process = null;
                     throw;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 共享模式：放弃本端进程句柄，不杀 Python（其它桌宠继续用）。
+        /// </summary>
+        public void Detach()
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    if (_process != null)
+                    {
+                        try { _process.Dispose(); } catch { }
+                        _process = null;
+                    }
+                    CloseJobObject();
+                }
+                catch (Exception ex)
+                {
+                    LogWarn($"Detach 异常：{ex.Message}");
                 }
             }
         }
@@ -1254,6 +1466,312 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             catch
             {
                 return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 多桌宠共享同一 TTS 进程的跨进程协调：
+    /// - 客户端注册表（心跳文件）
+    /// - 启动互斥（只起一个 Python）
+    /// - 合成互斥（全局串行，避免并发 500）
+    /// </summary>
+    internal sealed class CosyVoiceSharedGate : IDisposable
+    {
+        private readonly int _port;
+        private readonly string _clientDir;
+        private readonly string _clientFile;
+        private readonly string _synthBusyFile;
+        private readonly Mutex _startMutex;
+        private readonly Mutex _synthMutex;
+        private readonly string _clientId = $"{Environment.ProcessId}_{Guid.NewGuid():N}";
+        private bool _registered;
+        private bool _disposed;
+
+        public CosyVoiceSharedGate(int port, string projectDir)
+        {
+            _port = port > 0 ? port : 9981;
+            string root = !string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir)
+                ? projectDir
+                : Path.GetTempPath();
+            _clientDir = Path.Combine(root, ".cosyvoice_alife_clients");
+            Directory.CreateDirectory(_clientDir);
+            _clientFile = Path.Combine(_clientDir, $"p{_port}_{_clientId}.client");
+            _synthBusyFile = Path.Combine(_clientDir, $"p{_port}.synthbusy");
+
+            // 优先 Global\；无权限时回退 Local\
+            _startMutex = CreateMutexSafe($@"Global\Alife.CosyVoice.Start.{_port}",
+                $@"Local\Alife.CosyVoice.Start.{_port}");
+            _synthMutex = CreateMutexSafe($@"Global\Alife.CosyVoice.Synth.{_port}",
+                $@"Local\Alife.CosyVoice.Synth.{_port}");
+        }
+
+        private static Mutex CreateMutexSafe(string preferred, string fallback)
+        {
+            try { return new Mutex(false, preferred); }
+            catch { return new Mutex(false, fallback); }
+        }
+
+        public void RegisterClient()
+        {
+            try
+            {
+                TouchClientFile();
+                _registered = true;
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        /// <summary>注销并返回剩余存活客户端数（不含自己）。</summary>
+        public int UnregisterClient()
+        {
+            try
+            {
+                if (File.Exists(_clientFile))
+                    File.Delete(_clientFile);
+            }
+            catch { /* ignore */ }
+            _registered = false;
+            return CountLiveClients();
+        }
+
+        public int CountLiveClients()
+        {
+            try
+            {
+                if (!Directory.Exists(_clientDir))
+                    return 0;
+
+                var now = DateTime.UtcNow;
+                int count = 0;
+                foreach (var f in Directory.EnumerateFiles(_clientDir, $"p{_port}_*.client"))
+                {
+                    try
+                    {
+                        // 超过 90 秒未心跳视为僵尸（原先 3 分钟过长，桌宠异常退出后会误判仍有客户端）
+                        var age = now - File.GetLastWriteTimeUtc(f);
+                        if (age > TimeSpan.FromSeconds(90))
+                        {
+                            try { File.Delete(f); } catch { }
+                            continue;
+                        }
+
+                        // 文件内容为 "pid|timestamp"：进程已死则立即清理，避免残留锁死停服/重启
+                        if (!IsClientProcessAlive(f))
+                        {
+                            try { File.Delete(f); } catch { }
+                            continue;
+                        }
+
+                        count++;
+                    }
+                    catch { /* ignore */ }
+                }
+                return count;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// 客户端文件内容为 "pid|..."；进程不存在则视为僵尸。
+        /// </summary>
+        private static bool IsClientProcessAlive(string clientFile)
+        {
+            try
+            {
+                string text = File.ReadAllText(clientFile).Trim();
+                if (string.IsNullOrEmpty(text))
+                    return true; // 旧格式无 pid，仅靠心跳时间判断
+
+                string pidPart = text;
+                int sep = text.IndexOf('|');
+                if (sep >= 0)
+                    pidPart = text[..sep];
+
+                if (!int.TryParse(pidPart, out int pid) || pid <= 0)
+                    return true;
+
+                try
+                {
+                    var p = Process.GetProcessById(pid);
+                    return !p.HasExited;
+                }
+                catch (ArgumentException)
+                {
+                    return false; // 进程不存在
+                }
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        public IDisposable? TryAcquireStart(TimeSpan timeout)
+        {
+            try
+            {
+                if (!_startMutex.WaitOne(timeout))
+                    return null;
+                return new MutexHold(_startMutex);
+            }
+            catch (AbandonedMutexException)
+            {
+                // 前持有者崩溃，视为已获得
+                return new MutexHold(_startMutex);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        public async Task<IDisposable> AcquireSynthAsync(CancellationToken ct)
+        {
+            // 心跳：长时间排队时仍标记本客户端存活
+            TouchClientFile();
+
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    if (_synthMutex.WaitOne(0))
+                    {
+                        MarkSynthBusy(true);
+                        return new SynthHold(_synthMutex, () => MarkSynthBusy(false));
+                    }
+                }
+                catch (AbandonedMutexException)
+                {
+                    MarkSynthBusy(true);
+                    return new SynthHold(_synthMutex, () => MarkSynthBusy(false));
+                }
+
+                await Task.Delay(80, ct).ConfigureAwait(false);
+                if ((Environment.TickCount & 0x3F) == 0)
+                    TouchClientFile();
+            }
+        }
+
+        /// <summary>其它进程是否正持有合成锁（本进程未持有时探测）。</summary>
+        public bool IsSynthBusyElsewhere()
+        {
+            try
+            {
+                if (File.Exists(_synthBusyFile))
+                {
+                    var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(_synthBusyFile);
+                    // 忙标记超过 90 秒视为残留（原先 3 分钟过长，会误挡看门狗重启）
+                    if (age < TimeSpan.FromSeconds(90))
+                    {
+                        // 若 busy 文件里的 pid 已死，立即清掉
+                        if (!IsClientProcessAlive(_synthBusyFile))
+                        {
+                            try { File.Delete(_synthBusyFile); } catch { }
+                        }
+                        else
+                        {
+                            return true;
+                        }
+                    }
+                    else
+                    {
+                        try { File.Delete(_synthBusyFile); } catch { }
+                    }
+                }
+            }
+            catch { /* ignore */ }
+
+            try
+            {
+                if (_synthMutex.WaitOne(0))
+                {
+                    _synthMutex.ReleaseMutex();
+                    return false;
+                }
+                return true;
+            }
+            catch (AbandonedMutexException)
+            {
+                try { _synthMutex.ReleaseMutex(); } catch { }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void TouchClientFile()
+        {
+            try
+            {
+                File.WriteAllText(_clientFile, $"{Environment.ProcessId}|{DateTime.UtcNow:O}");
+            }
+            catch { /* ignore */ }
+        }
+
+        private void MarkSynthBusy(bool busy)
+        {
+            try
+            {
+                if (busy)
+                    File.WriteAllText(_synthBusyFile, $"{Environment.ProcessId}|{DateTime.UtcNow:O}");
+                else if (File.Exists(_synthBusyFile))
+                    File.Delete(_synthBusyFile);
+            }
+            catch { /* ignore */ }
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            try
+            {
+                if (_registered)
+                    UnregisterClient();
+            }
+            catch { /* ignore */ }
+            try { _startMutex.Dispose(); } catch { }
+            try { _synthMutex.Dispose(); } catch { }
+        }
+
+        private sealed class MutexHold : IDisposable
+        {
+            private Mutex? _m;
+            public MutexHold(Mutex m) => _m = m;
+            public void Dispose()
+            {
+                var m = Interlocked.Exchange(ref _m, null);
+                if (m == null) return;
+                try { m.ReleaseMutex(); } catch { }
+            }
+        }
+
+        private sealed class SynthHold : IDisposable
+        {
+            private Mutex? _m;
+            private Action? _onRelease;
+            public SynthHold(Mutex m, Action onRelease)
+            {
+                _m = m;
+                _onRelease = onRelease;
+            }
+            public void Dispose()
+            {
+                var on = Interlocked.Exchange(ref _onRelease, null);
+                try { on?.Invoke(); } catch { }
+                var m = Interlocked.Exchange(ref _m, null);
+                if (m == null) return;
+                try { m.ReleaseMutex(); } catch { }
             }
         }
     }

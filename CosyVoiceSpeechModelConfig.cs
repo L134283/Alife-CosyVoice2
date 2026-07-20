@@ -46,6 +46,12 @@ public class CosyVoiceSpeechModelConfig
     /// <summary>是否由插件自动拉起本地服务；若你已手动启动可设为 false。</summary>
     public bool AutoStart { get; set; } = true;
 
+    /// <summary>
+    /// 多桌宠共享同一 TTS 进程（推荐）。
+    /// 开启后：同端口只保留一个 Python；跨进程串行合成；退出时仅最后一位客户端停服；不绑定 KillOnClose Job。
+    /// </summary>
+    public bool SharedService { get; set; } = true;
+
     /// <summary>单次 TTS HTTP 超时（秒）。</summary>
     public int RequestTimeoutSeconds { get; set; } = 120;
 

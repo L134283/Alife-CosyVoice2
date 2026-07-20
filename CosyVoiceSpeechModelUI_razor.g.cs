@@ -605,7 +605,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert-desc");
             b.AddContent(i++,
-                "基于 yinmei-cosyvoice。推荐 Mode=1（仅 API）更省资源；风格指令留空则用音色默认语气。修改路径/端口后请重新加载模块。");
+                "基于 yinmei-cosyvoice。推荐 Mode=1 + 共享服务：多桌宠共用一个 TTS 进程；风格指令留空则用音色默认语气。修改路径/端口后请重新加载模块。");
             b.CloseElement();
             b.CloseElement();
             b.CloseElement();
@@ -714,6 +714,17 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddAttribute(i++, "class", "cv-chip-row");
             AddBoolChip(b, ref i, true, "开启自动启动");
             AddBoolChip(b, ref i, false, "仅连接已有服务");
+            b.CloseElement();
+
+            AddLabel(b, ref i, "共享服务 SharedService（多桌宠推荐）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "开启后：同端口只跑一个 Python；跨进程串行合成；关掉一个桌宠不会带走 TTS");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-chip-row");
+            AddSharedChip(b, ref i, true, "共享 · 多桌宠一个进程");
+            AddSharedChip(b, ref i, false, "独占 · 退出即停服");
             b.CloseElement();
 
             // ---- 高级折叠 ----
@@ -826,6 +837,21 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
             {
                 Configuration.AutoStart = value;
+                StateHasChanged();
+            }));
+            b.AddContent(seq++, label);
+            b.CloseElement();
+        }
+
+        private void AddSharedChip(RenderTreeBuilder b, ref int seq, bool value, string label)
+        {
+            bool on = Configuration!.SharedService == value;
+            b.OpenElement(seq++, "button");
+            b.AddAttribute(seq++, "type", "button");
+            b.AddAttribute(seq++, "class", on ? "cv-chip cv-chip-on" : "cv-chip");
+            b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
+            {
+                Configuration.SharedService = value;
                 StateHasChanged();
             }));
             b.AddContent(seq++, label);
