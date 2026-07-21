@@ -25,6 +25,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private List<string> _speakerOptions = new(BuiltinSpeakers);
         private string _speakerHint = "内置列表（服务未连接时）";
         private bool _refreshing;
+        private bool _cleaning;
+        private string _cleanupHint = "";
 
         // 星语粉紫 · Cosy 语音台：粉点缀 + 紫雾流光 + 声波装饰
         private const string Css = @"
@@ -368,11 +370,61 @@ namespace Alife.Function.Speech.CosyVoiceTTS
     background: linear-gradient(135deg, #c9a0ff, #9b6dff);
     color: #fff;
 }
+.cv-btn-danger {
+    border-color: #f5a0b8;
+    color: #b8325a;
+    background: linear-gradient(145deg, #fff5f8, #fff);
+}
+.cv-btn-danger:hover {
+    background: linear-gradient(135deg, #ff6b9d, #e04080);
+    color: #fff;
+    border-color: transparent;
+}
 .cv-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
     transform: none !important;
     box-shadow: none !important;
+}
+.cv-cleanup-hint {
+    margin-top: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #7b4db8;
+    line-height: 1.45;
+}
+
+/* 下载链接行 */
+.cv-link-row {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0 0 14px 2px;
+    flex-wrap: wrap;
+}
+.cv-link {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #c8457a;
+    text-decoration: none;
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: linear-gradient(145deg, #fff0f8, #f6eeff);
+    border: 1px solid rgba(200,120,180,0.45);
+    transition: all 0.2s;
+}
+.cv-link:hover {
+    background: linear-gradient(135deg, #ff8fbf, #c9a0ff);
+    color: #fff;
+    border-color: transparent;
+    box-shadow: 0 3px 12px rgba(200,100,160,0.3);
+}
+.cv-link-sep {
+    font-size: 13px;
+    color: #d4a0c0;
+    font-weight: 600;
 }
 
 /* Mode 快捷芯片 */
@@ -539,6 +591,34 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
         }
 
+        /// <summary>
+        /// 清理僵尸 TTS：不依赖桌宠是否已启动，直接按配置端口/PID 文件杀残留。
+        /// Alife 被叉掉后端口被占、打不开桌宠时点此。
+        /// </summary>
+        private async Task OnCleanupOrphans()
+        {
+            if (Configuration == null || _cleaning) return;
+            _cleaning = true;
+            _cleanupHint = "正在清理…";
+            StateHasChanged();
+            try
+            {
+                // 静态清理：配置页即可用，不依赖桌宠/模块是否已 Awake
+                string msg = await Task.Run(() => CosyVoiceServiceHost.CleanupOrphans(Configuration));
+                _cleanupHint = msg;
+                Console.WriteLine($"[Cosy语音] {msg}");
+            }
+            catch (Exception ex)
+            {
+                _cleanupHint = "清理失败：" + ex.Message;
+                Console.WriteLine($"[Cosy语音][错误] 手动清理失败：{ex.Message}");
+            }
+            finally
+            {
+                _cleaning = false;
+            }
+        }
+
         protected override void BuildRenderTree(RenderTreeBuilder b)
         {
             b.OpenElement(0, "style");
@@ -589,26 +669,103 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             b.CloseElement(); // header
 
-            // ---- 说明 ----
+            // ---- 整合包下载（新手必看）----
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert");
+            b.AddAttribute(i++, "style", "background:linear-gradient(145deg,#fff0f8,#f6eeff);border-color:rgba(200,120,180,0.5);");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert-icon");
-            b.AddContent(i++, "\u266A");
+            b.AddContent(i++, "\u2B07");
             b.CloseElement();
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert-body");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert-title");
-            b.AddContent(i++, "本地 CosyVoice2 引擎");
+            b.AddContent(i++, "yinmei-cosyvoice2 整合包下载");
             b.CloseElement();
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-alert-desc");
-            b.AddContent(i++,
-                "基于 yinmei-cosyvoice。推荐 Mode=1 + 共享服务：多桌宠共用一个 TTS 进程；风格指令留空则用音色默认语气。修改路径/端口后请重新加载模块。");
+            b.AddContent(i++, "作者 B站：程序员的退休生活  ·  下载解压即用，无需折腾 Python 环境");
             b.CloseElement();
             b.CloseElement();
             b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-link-row");
+            b.OpenElement(i++, "a");
+            b.AddAttribute(i++, "href", "https://pan.baidu.com/s/10fmcGfksHsSKAS8LckYTqQ?pwd=29tq");
+            b.AddAttribute(i++, "target", "_blank");
+            b.AddAttribute(i++, "class", "cv-link");
+            b.AddContent(i++, "百度网盘（提取码：29tq）");
+            b.CloseElement();
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cv-link-sep");
+            b.AddContent(i++, "|");
+            b.CloseElement();
+            b.OpenElement(i++, "a");
+            b.AddAttribute(i++, "href", "https://pan.quark.cn/s/b666220e73c2");
+            b.AddAttribute(i++, "target", "_blank");
+            b.AddAttribute(i++, "class", "cv-link");
+            b.AddContent(i++, "夸克网盘（提取码：kibi）");
+            b.CloseElement();
+            b.CloseElement();
+
+            // ---- 使用教程 ----
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-alert");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-alert-icon");
+            b.AddContent(i++, "\U0001F4D6");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-alert-body");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-alert-title");
+            b.AddContent(i++, "小白三步上手");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-alert-desc");
+            b.AddContent(i++, "1. 下载整合包并解压到 D 盘 ·  2. 确保下方路径与你的解压位置一致 ·  3. 勾选「自动启动」+「共享服务」→ 重载模块即可");
+            b.CloseElement();
+            b.CloseElement();
+            b.CloseElement();
+
+            // ---- 旧版说明 (精简) ----
+
+            // ---- 僵尸清理（Alife 被叉掉后端口残留时用）----
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-section");
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cv-section-icon");
+            b.AddContent(i++, "\u26A1");
+            b.CloseElement();
+            b.AddContent(i++, "残留进程");
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "直接叉掉 Alife 后 TTS 可能残留占端口，导致桌宠打不开。点下方按钮结束僵尸进程并清共享状态。");
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-row");
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cv-btn cv-btn-danger");
+            b.AddAttribute(i++, "disabled", _cleaning);
+            b.AddAttribute(i++, "onclick",
+                EventCallback.Factory.Create(this, async () => await OnCleanupOrphans()));
+            b.AddContent(i++, _cleaning ? "清理中…" : "清理僵尸 TTS 进程");
+            b.CloseElement();
+            b.CloseElement();
+
+            if (!string.IsNullOrEmpty(_cleanupHint))
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cv-cleanup-hint");
+                b.AddContent(i++, _cleanupHint);
+                b.CloseElement();
+            }
 
             // ---- 音色与效果 ----
             b.OpenElement(i++, "div");
@@ -620,7 +777,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddContent(i++, "音色与效果");
             b.CloseElement();
 
-            AddLabel(b, ref i, "音色 spkid");
+            AddLabel(b, ref i, "音色 spkid（选一个喜欢的说话角色）");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-hint");
             b.AddContent(i++, _speakerHint + " · " + string.Join(" / ", _speakerOptions.Take(12))
@@ -659,11 +816,15 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.CloseElement();
             b.CloseElement();
 
-            AddInput(b, ref i, "风格指令 Instruct（可选，如：用开心的语气说）",
+            AddInput(b, ref i, "风格指令 Instruct（可选，如：用开心的语气说 / 语速放慢 / 大声一点）",
                 Configuration.Instruct ?? "",
                 v => Configuration.Instruct = v);
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "留空则用音色默认语气。常见指令：用开心的语气说、悲伤一点、小声一点、像机器人一样说话。");
+            b.CloseElement();
 
-            AddInput(b, ref i, "语速 Speed（默认 1.0）",
+            AddInput(b, ref i, "语速 Speed（1.0 = 正常，0.5 = 慢，1.5 = 快）",
                 Configuration.Speed.ToString("0.##"),
                 v =>
                 {
@@ -681,11 +842,11 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddContent(i++, "服务与路径");
             b.CloseElement();
 
-            AddInput(b, ref i, "API 地址",
+            AddInput(b, ref i, "API 地址（无需修改）",
                 Configuration.ApiUrl,
                 v => Configuration.ApiUrl = v);
 
-            AddInput(b, ref i, "API 端口",
+            AddInput(b, ref i, "API 端口（默认 9981，别改）",
                 Configuration.Port.ToString(),
                 v =>
                 {
@@ -699,62 +860,66 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             AddLabel(b, ref i, "启动模式 Mode");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-hint");
-            b.AddContent(i++, "1 = 仅 API（推荐） · 2 = 仅 WebUI · 3 = API + WebUI");
+            b.AddContent(i++, "新手选 Mode 1 即可（只需后台 API，省资源）。Mode 2/3 会弹出浏览器 WebUI 界面。");
             b.CloseElement();
 
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-chip-row");
-            AddModeChip(b, ref i, 1, "Mode 1 · 仅 API");
+            AddModeChip(b, ref i, 1, "Mode 1 · 仅 API（推荐）");
             AddModeChip(b, ref i, 2, "Mode 2 · WebUI");
             AddModeChip(b, ref i, 3, "Mode 3 · 双开");
             b.CloseElement();
 
-            AddLabel(b, ref i, "自动启动 AutoStart");
-            b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cv-chip-row");
-            AddBoolChip(b, ref i, true, "开启自动启动");
-            AddBoolChip(b, ref i, false, "仅连接已有服务");
-            b.CloseElement();
-
-            AddLabel(b, ref i, "共享服务 SharedService（多桌宠推荐）");
+            AddLabel(b, ref i, "自动启动 AutoStart（新手必开）");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-hint");
-            b.AddContent(i++, "开启后：同端口只跑一个 Python；跨进程串行合成；关掉一个桌宠不会带走 TTS");
+            b.AddContent(i++, "开启后：打开桌宠时自动拉起 TTS 服务。关闭则需你手动启动或已有服务在跑。");
             b.CloseElement();
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-chip-row");
-            AddSharedChip(b, ref i, true, "共享 · 多桌宠一个进程");
-            AddSharedChip(b, ref i, false, "独占 · 退出即停服");
+            AddBoolChip(b, ref i, true, "开启 · 自动启动");
+            AddBoolChip(b, ref i, false, "关闭 · 仅连接已有服务");
             b.CloseElement();
 
-            // ---- 高级折叠 ----
-            b.OpenElement(i++, "details");
-            b.AddAttribute(i++, "class", "cv-details");
+            AddLabel(b, ref i, "共享服务 SharedService（单桌宠建议关）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "单桌宠：关闭更快，无启动卡顿。多桌宠：开启可共用 TTS。默认关闭。");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-chip-row");
+            AddSharedChip(b, ref i, false, "关闭 · 单桌宠推荐");
+            AddSharedChip(b, ref i, true, "开启 · 多桌宠共享");
+            b.CloseElement();
 
-            b.OpenElement(i++, "summary");
+            // ---- 高级路径与超时（展开）----
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-section");
             b.OpenElement(i++, "span");
-            b.AddAttribute(i++, "class", "cv-arrow");
-            b.AddContent(i++, "\u25B6");
+            b.AddAttribute(i++, "class", "cv-section-icon");
+            b.AddContent(i++, "\u23F1");
             b.CloseElement();
-            b.AddContent(i++, "高级路径与超时");
+            b.AddContent(i++, "高级路径与超时（请修改为自己的整合包对应路径）");
             b.CloseElement();
 
             b.OpenElement(i++, "div");
-            b.AddAttribute(i++, "class", "cv-details-content");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "以下路径由整合包默认位置生成。如果你把解压文件夹改到了别处，请对应修改。超时参数越大越稳，但卡死时等更久。");
+            b.CloseElement();
 
-            AddInput(b, ref i, "Python 路径",
+            AddInput(b, ref i, "Python 路径（整合包自带的 python.exe）",
                 Configuration.PythonPath,
                 v => Configuration.PythonPath = v);
 
-            AddInput(b, ref i, "项目目录 ProjectDir",
+            AddInput(b, ref i, "项目目录 ProjectDir（start.py 所在文件夹）",
                 Configuration.ProjectDir,
                 v => Configuration.ProjectDir = v);
 
-            AddInput(b, ref i, "模型目录 ModelDir",
+            AddInput(b, ref i, "模型目录 ModelDir（CosyVoice2 权重文件夹）",
                 Configuration.ModelDir,
                 v => Configuration.ModelDir = v);
 
-            AddInput(b, ref i, "WebUI 端口（Mode=2/3 时）",
+            AddInput(b, ref i, "WebUI 端口（Mode=2/3 时用）",
                 Configuration.WebPort.ToString(),
                 v =>
                 {
@@ -762,7 +927,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.WebPort = n;
                 });
 
-            AddInput(b, ref i, "流式切片 LimitCount（越大越稳；非流式影响小）",
+            AddInput(b, ref i, "流式切片 LimitCount（首包响应速度，默认 10）",
                 Configuration.LimitCount.ToString(),
                 v =>
                 {
@@ -770,7 +935,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.LimitCount = n;
                 });
 
-            AddInput(b, ref i, "请求超时秒数",
+            AddInput(b, ref i, "单次合成超时秒数（GPU 忙时可能卡住）",
                 Configuration.RequestTimeoutSeconds.ToString(),
                 v =>
                 {
@@ -778,7 +943,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.RequestTimeoutSeconds = n;
                 });
 
-            AddInput(b, ref i, "就绪等待秒数",
+            AddInput(b, ref i, "等待模型加载最长时间秒数（首次启动较慢）",
                 Configuration.ReadyTimeoutSeconds.ToString(),
                 v =>
                 {
@@ -786,7 +951,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.ReadyTimeoutSeconds = n;
                 });
 
-            AddInput(b, ref i, "失败重启阈值 RestartAfterFailures",
+            AddInput(b, ref i, "连续失败多少次后自动重启服务",
                 Configuration.RestartAfterFailures.ToString(),
                 v =>
                 {
@@ -794,8 +959,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.RestartAfterFailures = n;
                 });
 
-            b.CloseElement(); // details-content
-            b.CloseElement(); // details
+            AddInput(b, ref i, "合成锁超时秒数（避免卡死无限等）",
+                Configuration.SynthLockTimeoutSeconds.ToString(),
+                v =>
+                {
+                    if (int.TryParse(v, out var n) && n >= 10)
+                        Configuration.SynthLockTimeoutSeconds = n;
+                });
 
             // footer
             b.OpenElement(i++, "div");

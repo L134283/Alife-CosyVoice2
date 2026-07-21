@@ -47,17 +47,20 @@ public class CosyVoiceSpeechModelConfig
     public bool AutoStart { get; set; } = true;
 
     /// <summary>
-    /// 多桌宠共享同一 TTS 进程（推荐）。
-    /// 开启后：同端口只保留一个 Python；跨进程串行合成；退出时仅最后一位客户端停服；不绑定 KillOnClose Job。
+    /// 多桌宠共享同一 TTS 进程。单桌宠建议关闭：更快、不卡启动锁、叉掉 Alife 自动停服。
+    /// 开启后：同端口只保留一个 Python；跨进程串行合成；退出时仅最后一位客户端停服。
     /// </summary>
-    public bool SharedService { get; set; } = true;
+    public bool SharedService { get; set; } = false;
 
     /// <summary>单次 TTS HTTP 超时（秒）。</summary>
-    public int RequestTimeoutSeconds { get; set; } = 120;
+    public int RequestTimeoutSeconds { get; set; } = 90;
 
     /// <summary>等待服务就绪的最长时间（秒）。</summary>
     public int ReadyTimeoutSeconds { get; set; } = 180;
 
     /// <summary>健康检查失败多少次后重启服务。</summary>
     public int RestartAfterFailures { get; set; } = 6;
+
+    /// <summary>等待进程内/跨进程合成锁的最长时间（秒），超时放弃本次合成并触发恢复。</summary>
+    public int SynthLockTimeoutSeconds { get; set; } = 60;
 }
