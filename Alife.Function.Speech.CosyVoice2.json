@@ -15,6 +15,13 @@
   ],
   "source": "https://github.com/L134283/Alife-CosyVoice2",
   "releases": {
+    "1.3.2": {
+      "date": "2026-07-22",
+      "note": "修复 ZIP 包内容：仅含 .cs 源码及 VERSION，不再包含 .json/README.md；v1.2.1 重复标题消除；SharedService 默认关说明统一",
+      "file": "https://github.com/L134283/Alife-CosyVoice2/releases/download/CosyVoice2-v1.3.2/Alife.Function.Speech.CosyVoice2.zip",
+      "dependencies": null,
+      "environments": null
+    },
     "1.3.1": {
       "date": "2026-07-21",
       "note": "SharedService 默认关闭（单桌宠更快无启动卡顿）；跨进程锁 10s 超时 + 首次超时即强制恢复；UI 新增整合包下载链接、小白三步教程、说明全面补充；高级路径默认展开",
