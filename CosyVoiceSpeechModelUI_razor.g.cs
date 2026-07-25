@@ -892,6 +892,17 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             AddSharedChip(b, ref i, true, "开启 · 多桌宠共享");
             b.CloseElement();
 
+            AddLabel(b, ref i, "安静日志 QuietLog（日常使用建议开）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "开启后：仅输出错误与重要状态（就绪/重启/停服等），日常合成过程不刷屏。排查问题时再关闭。默认开启。");
+            b.CloseElement();
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-chip-row");
+            AddQuietLogChip(b, ref i, true, "开启 · 安静（推荐）");
+            AddQuietLogChip(b, ref i, false, "关闭 · 完整调试日志");
+            b.CloseElement();
+
             // ---- 高级路径与超时（展开）----
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-section");
@@ -1022,6 +1033,21 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
             {
                 Configuration.SharedService = value;
+                StateHasChanged();
+            }));
+            b.AddContent(seq++, label);
+            b.CloseElement();
+        }
+
+        private void AddQuietLogChip(RenderTreeBuilder b, ref int seq, bool value, string label)
+        {
+            bool on = Configuration!.QuietLog == value;
+            b.OpenElement(seq++, "button");
+            b.AddAttribute(seq++, "type", "button");
+            b.AddAttribute(seq++, "class", on ? "cv-chip cv-chip-on" : "cv-chip");
+            b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
+            {
+                Configuration.QuietLog = value;
                 StateHasChanged();
             }));
             b.AddContent(seq++, label);

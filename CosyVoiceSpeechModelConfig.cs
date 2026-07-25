@@ -63,4 +63,10 @@ public class CosyVoiceSpeechModelConfig
 
     /// <summary>等待进程内/跨进程合成锁的最长时间（秒），超时放弃本次合成并触发恢复。</summary>
     public int SynthLockTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// 安静日志（默认开）：开启后仅输出错误与重要状态变更（就绪/重启/停服等），
+    /// 日常合成过程日志全部静默；关闭则输出完整调试日志。
+    /// </summary>
+    public bool QuietLog { get; set; } = true;
 }

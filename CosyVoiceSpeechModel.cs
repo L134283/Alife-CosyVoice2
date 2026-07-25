@@ -79,9 +79,24 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         }
 
         // 用 Console 输出，避免 ILogger 默认的 info: Namespace.Class[0] 前缀
-        private static void Log(string msg) => Console.WriteLine($"[Cosy语音] {msg}");
-        private static void LogWarn(string msg) => Console.WriteLine($"[Cosy语音][警告] {msg}");
-        private static void LogError(string msg) => Console.WriteLine($"[Cosy语音][错误] {msg}");
+        // QuietLog=true（默认）：仅 Important/Warn/Error；false：全部输出
+        private bool Quiet => Configuration?.QuietLog ?? true;
+
+        private void Log(string msg)
+        {
+            if (Quiet) return;
+            Console.WriteLine($"[Cosy语音] {msg}");
+        }
+
+        /// <summary>重要状态变更，安静模式下仍输出。</summary>
+        private void LogImportant(string msg)
+            => Console.WriteLine($"[Cosy语音] {msg}");
+
+        private void LogWarn(string msg)
+            => Console.WriteLine($"[Cosy语音][警告] {msg}");
+
+        private void LogError(string msg)
+            => Console.WriteLine($"[Cosy语音][错误] {msg}");
 
         #region 生命周期
 
@@ -162,7 +177,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     _ready = true;
                     EnsureValidSpeaker();
                     await WarmupAsync();
-                    Log($"服务就绪，音色 {_speakers.Length} 个");
+                    LogImportant($"服务就绪，音色 {_speakers.Length} 个");
                 }
                 else
                 {
@@ -185,7 +200,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                             _ready = true;
                             EnsureValidSpeaker();
                             await WarmupAsync();
-                            Log($"服务就绪（重启后），音色 {_speakers.Length} 个");
+                            LogImportant($"服务就绪（重启后），音色 {_speakers.Length} 个");
                         }
                         else
                         {
@@ -233,7 +248,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     // 共享模式：仅最后一位存活客户端停服，避免关掉一个桌宠带走 TTS
                     if (remaining <= 0)
                     {
-                        Log("共享模式：已无其他客户端，停止服务");
+                        LogImportant("共享模式：已无其他客户端，停止服务");
                         _host?.Stop();
                     }
                     else
@@ -660,7 +675,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 {
                     _ready = true;
                     Interlocked.Exchange(ref _ttsFailStreak, 0);
-                    Log("Cosy 服务已重启并就绪");
+                    LogImportant("Cosy 服务已重启并就绪");
                 }
                 else
                 {
@@ -733,7 +748,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         if (ok)
                         {
                             if (!_ready)
-                                Log("服务已恢复");
+                                LogImportant("服务已恢复");
                             _ready = true;
                             failStreak = 0;
 
@@ -1073,9 +1088,27 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         private string PidFilePath => Path.Combine(_config.ProjectDir, ".cosyvoice_alife.pid");
 
-        private static void Log(string msg) => Console.WriteLine($"[Cosy语音] {msg}");
-        private static void LogWarn(string msg) => Console.WriteLine($"[Cosy语音][警告] {msg}");
-        private static void LogError(string msg) => Console.WriteLine($"[Cosy语音][错误] {msg}");
+        // QuietLog=true（默认）：仅 Important/Warn/Error；false：全部输出
+        private bool Quiet => _config.QuietLog;
+
+        private void Log(string msg)
+        {
+            if (Quiet) return;
+            Console.WriteLine($"[Cosy语音] {msg}");
+        }
+
+        private void LogImportant(string msg)
+            => Console.WriteLine($"[Cosy语音] {msg}");
+
+        private void LogWarn(string msg)
+            => Console.WriteLine($"[Cosy语音][警告] {msg}");
+
+        private void LogError(string msg)
+            => Console.WriteLine($"[Cosy语音][错误] {msg}");
+
+        /// <summary>静态清理路径用：始终输出（用户主动操作）。</summary>
+        private static void LogAlways(string msg)
+            => Console.WriteLine($"[Cosy语音] {msg}");
 
         public CosyVoiceServiceHost(CosyVoiceSpeechModelConfig config)
         {
@@ -1217,7 +1250,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     }
 
                     File.WriteAllText(PidFilePath, _process.Id.ToString());
-                    Log(bindJob
+                    LogImportant(bindJob
                         ? $"已启动（模式 {mode}，独占）"
                         : $"已启动（模式 {mode}，共享）");
                 }
@@ -1285,14 +1318,15 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             bool portStill = IsPortListening(port);
             bool webStill = webPort != port && IsPortListening(webPort);
 
+            // 用户主动点清理：始终输出结果
             if (killed > 0 || cleared > 0)
             {
-                Log($"手动清理完成：结束 {killed} 个进程，清理 {cleared} 个共享状态文件" +
+                LogAlways($"手动清理完成：结束 {killed} 个进程，清理 {cleared} 个共享状态文件" +
                     (portStill || webStill ? "（端口仍占用，请稍候再试或检查任务管理器）" : "，端口已释放"));
             }
             else
             {
-                Log(portStill || webStill
+                LogAlways(portStill || webStill
                     ? $"手动清理：未识别到可杀进程，但端口仍占用（API={port}{(webStill ? $", Web={webPort}" : "")}）"
                     : "手动清理：未发现残留 TTS 进程");
             }
@@ -1388,7 +1422,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
 
             if (killCount > 0)
-                Log($"已清理残留服务（{killCount} 个进程）");
+                LogImportant($"已清理残留服务（{killCount} 个进程）");
 
             // 等端口释放
             for (int i = 0; i < 15 && IsPortListening(_config.Port); i++)
@@ -1405,7 +1439,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 {
                     ForceCleanupUnlocked();
                     CloseJobObject();
-                    Log("服务已停止");
+                    LogImportant("服务已停止");
                 }
                 catch (Exception ex)
                 {
