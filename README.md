@@ -2,7 +2,7 @@
 
 基于本地 **CosyVoice2（yinmei）** 的 Alife 语音合成插件。由插件自动拉起本地 Python 服务，对接 `ISpeechModel`，供语音输出链路使用。
 
-> 依赖：`Alife.Function.Speech`  
+> 依赖：`Alife.Function.AIModelUtility`（提供 `ISpeechModel` 接口，4.0 起由 `Alife.Function.Speech` 消费）  
 > 本地服务：yinmei-cosyvoice（需自行安装模型与 Python 环境）
 
 ## 功能
@@ -116,7 +116,7 @@ Cosy 服务对纯标点 / 空白（如 `...`、`！！！`、`——`）会稳�
 
 ## 依赖与环境
 
-- **Alife 依赖**：`Alife.Function.Speech`
+- **Alife 依赖**：`Alife.Function.AIModelUtility`（提供 `ISpeechModel`；4.0 起语音播放由 `Alife.Function.Speech` 消费）
 - **本机环境**（不由插件 pip 安装）：
   - yinmei-cosyvoice 项目
   - 对应 Python 解释器
@@ -145,6 +145,15 @@ Python：D:\1TTS\yinmei-cosyvoice\python311\python.exe
 | **关** | 额外输出合成过程、锁等待、预热、健康检查细节等 |
 
 ## 版本
+
+### v4.0.0
+
+- **适配 Alife 4.0.1 框架**：
+  - 生命周期改用 `ChatBehaviour`（`OnAwake`/`OnDestroy`），`ISystemEvent` 已在框架中过时
+  - `ISpeechModel` 接口迁移至 `Alife.Function.AIModelUtility` 插件
+  - `AlifePath.TempFolderPath` 迁移至 `Alife.Foundation` 命名空间
+  - 新增插件清单 `manifest.json`（依赖 `Alife.Function.AIModelUtility`）
+- 功能与 v1.3.3 完全一致，仅框架适配
 
 ### v1.3.3
 

@@ -12,7 +12,8 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
-using Alife.Platform;
+using Alife.Foundation;
+using Alife.Function.AIModelUtility;
 
 namespace Alife.Function.Speech.CosyVoiceTTS
 {
@@ -23,10 +24,9 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         EditorUI = typeof(CosyVoiceSpeechModelUI)
     )]
     public class CosyVoiceSpeechModel :
+        ChatBehaviour,
         ISpeechModel,
-        IConfigurable<CosyVoiceSpeechModelConfig>,
-        ISystemEvent,
-        IAsyncDisposable
+        IConfigurable<CosyVoiceSpeechModelConfig>
     {
         public CosyVoiceSpeechModelConfig? Configuration { get; set; }
 
@@ -100,7 +100,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         #region 生命周期
 
-        public async Task AwakeAsync(AwakeContext context)
+        protected override async Task OnAwake()
         {
             Configuration ??= new CosyVoiceSpeechModelConfig();
             NormalizeApiUrl();
@@ -229,7 +229,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             StartWatchdog();
         }
 
-        public async ValueTask DisposeAsync()
+        protected override async Task OnDestroy()
         {
             try
             {
