@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Microsoft.AspNetCore.Components;
@@ -12,7 +13,7 @@ using AntDesign;
 namespace Alife.Function.Speech.CosyVoiceTTS
 {
     public partial class CosyVoiceSpeechModelUI
-        : ModuleUIBase<CosyVoiceSpeechModel, CosyVoiceSpeechModelConfig>
+        : ModuleUIBase<CosyVoiceSpeechModel, CosyVoiceSpeechModelConfig>, IDisposable
     {
         private static readonly string[] BuiltinSpeakers =
         {
@@ -27,6 +28,16 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private bool _refreshing;
         private bool _cleaning;
         private string _cleanupHint = "";
+
+        // 服务控制（桌宠未开启也能用）
+        private bool _serviceReady;
+        private bool _servicePortUp;
+        private bool _ctrlBusy;
+        private bool _disposed;
+        private volatile bool _polling;
+        private string _statusText = "检测中…";
+        private string _ctrlMsg = "";
+        private Timer? _statusTimer;
 
         // 星语粉紫 · Cosy 语音台：粉点缀 + 紫雾流光 + 声波装饰
         private const string Css = @"
@@ -203,6 +214,16 @@ namespace Alife.Function.Speech.CosyVoiceTTS
     border: 1px solid #e2d8ea;
 }
 .cv-badge-off::before { content: '\25CB'; font-size: 9px; }
+.cv-badge-loading {
+    background: linear-gradient(135deg, #ffb74d, #ff8fbf);
+    color: #fff;
+    box-shadow: 0 3px 12px rgba(255,152,0,0.4), 0 0 0 1px rgba(255,255,255,0.25) inset;
+}
+.cv-badge-loading::before {
+    content: '\25CF';
+    font-size: 9px;
+    animation: cv-pulse 1.2s ease-in-out infinite;
+}
 @keyframes cv-pulse {
     0%,100% { opacity: 1; transform: scale(1); text-shadow: 0 0 4px #fff; }
     50% { opacity: 0.45; transform: scale(0.75); }
@@ -544,6 +565,125 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         {
             await base.OnInitializedAsync();
             await TryLoadSpeakersAsync();
+            StartStatusTimer();
+        }
+
+        public void Dispose()
+        {
+            _disposed = true;
+            try { _statusTimer?.Dispose(); } catch { }
+            _statusTimer = null;
+        }
+
+        private void StartStatusTimer()
+        {
+            try { _statusTimer?.Dispose(); } catch { }
+            _statusTimer = new Timer(
+                async _ => await PollServiceStatusAsync(),
+                null,
+                TimeSpan.FromSeconds(1),
+                TimeSpan.FromSeconds(5));
+        }
+
+        /// <summary>轮询服务状态：端口是否监听 + /get_spk 是否就绪。</summary>
+        private async Task PollServiceStatusAsync()
+        {
+            if (Configuration == null || _disposed || _polling) return;
+            _polling = true;
+            try
+            {
+                var (ready, portUp) = await Task.Run(() => ProbeStatus(Configuration));
+                if (_disposed) return;
+                _serviceReady = ready;
+                _servicePortUp = portUp;
+                _statusText = ready
+                    ? "运行中 · 已就绪"
+                    : portUp
+                        ? "启动中 · 模型加载中…"
+                        : "未运行";
+                await InvokeAsync(StateHasChanged);
+            }
+            catch { }
+            finally { _polling = false; }
+        }
+
+        private static (bool Ready, bool PortUp) ProbeStatus(CosyVoiceSpeechModelConfig cfg)
+        {
+            try
+            {
+                bool portUp = CosyVoiceServiceHost.IsPortInUse(cfg.Port);
+                if (!portUp) return (false, false);
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+                string baseUrl = string.IsNullOrWhiteSpace(cfg.ApiUrl)
+                    ? $"http://127.0.0.1:{cfg.Port}"
+                    : cfg.ApiUrl.TrimEnd('/');
+                using var resp = http.GetAsync(baseUrl + "/get_spk").GetAwaiter().GetResult();
+                return (resp.IsSuccessStatusCode, true);
+            }
+            catch
+            {
+                return (false, true);
+            }
+        }
+
+        private async Task OnStartService()
+        {
+            if (Configuration == null || _ctrlBusy) return;
+            _ctrlBusy = true;
+            _ctrlMsg = "正在启动服务…";
+            StateHasChanged();
+            try
+            {
+                string msg = await Task.Run(() => Module != null
+                    ? Module.ManualStart()
+                    : CosyVoiceSpeechModel.StartService(Configuration));
+                _ctrlMsg = msg;
+                Console.WriteLine($"[Cosy语音] {msg}");
+            }
+            catch (Exception ex)
+            {
+                _ctrlMsg = "启动失败：" + ex.Message;
+                Console.WriteLine($"[Cosy语音][错误] 手动启动失败：{ex.Message}");
+            }
+            finally
+            {
+                _ctrlBusy = false;
+                await PollServiceStatusAsync();
+                StateHasChanged();
+            }
+        }
+
+        private async Task OnStopService()
+        {
+            if (Configuration == null || _ctrlBusy) return;
+            _ctrlBusy = true;
+            _ctrlMsg = "正在停止服务…";
+            StateHasChanged();
+            try
+            {
+                string msg = await Task.Run(() => Module != null
+                    ? Module.ManualStop()
+                    : CosyVoiceSpeechModel.StopService(Configuration));
+                _ctrlMsg = msg;
+                Console.WriteLine($"[Cosy语音] {msg}");
+            }
+            catch (Exception ex)
+            {
+                _ctrlMsg = "停止失败：" + ex.Message;
+                Console.WriteLine($"[Cosy语音][错误] 手动停止失败：{ex.Message}");
+            }
+            finally
+            {
+                _ctrlBusy = false;
+                await PollServiceStatusAsync();
+                StateHasChanged();
+            }
+        }
+
+        private async Task OnRefreshStatus()
+        {
+            if (Configuration == null) return;
+            await PollServiceStatusAsync();
         }
 
         private async Task TryLoadSpeakersAsync()
@@ -668,6 +808,69 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.CloseElement();
 
             b.CloseElement(); // header
+
+            // ---- 服务控制（桌宠未开启也能用）----
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-section");
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cv-section-icon");
+            b.AddContent(i++, "\u26A1");
+            b.CloseElement();
+            b.AddContent(i++, "服务控制");
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-row");
+            b.AddAttribute(i++, "style", "align-items:center;");
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", _serviceReady
+                ? "cv-badge-on"
+                : _servicePortUp
+                    ? "cv-badge-on cv-badge-loading"
+                    : "cv-badge-off");
+            b.AddContent(i++, _statusText);
+            b.CloseElement();
+
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cv-btn cv-btn-primary");
+            b.AddAttribute(i++, "disabled", _ctrlBusy);
+            b.AddAttribute(i++, "onclick",
+                EventCallback.Factory.Create(this, async () => await OnStartService()));
+            b.AddContent(i++, "启动服务");
+            b.CloseElement();
+
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cv-btn cv-btn-danger");
+            b.AddAttribute(i++, "disabled", _ctrlBusy);
+            b.AddAttribute(i++, "onclick",
+                EventCallback.Factory.Create(this, async () => await OnStopService()));
+            b.AddContent(i++, "停止服务");
+            b.CloseElement();
+
+            b.OpenElement(i++, "button");
+            b.AddAttribute(i++, "type", "button");
+            b.AddAttribute(i++, "class", "cv-btn cv-btn-refresh");
+            b.AddAttribute(i++, "disabled", _ctrlBusy);
+            b.AddAttribute(i++, "onclick",
+                EventCallback.Factory.Create(this, async () => await OnRefreshStatus()));
+            b.AddContent(i++, "刷新状态");
+            b.CloseElement();
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "桌宠没开也能点这里。机械硬盘加载模型可能要 10-20 分钟：先点「启动服务」让模型在后台慢慢加载，之后开桌宠即可秒用；若不想桌宠启动时自动拉服务，请关闭下方「自动启动」。");
+            b.CloseElement();
+
+            if (!string.IsNullOrEmpty(_ctrlMsg))
+            {
+                b.OpenElement(i++, "div");
+                b.AddAttribute(i++, "class", "cv-cleanup-hint");
+                b.AddContent(i++, _ctrlMsg);
+                b.CloseElement();
+            }
 
             // ---- 整合包下载（新手必看）----
             b.OpenElement(i++, "div");
@@ -842,11 +1045,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddContent(i++, "服务与路径");
             b.CloseElement();
 
-            AddInput(b, ref i, "API 地址（无需修改）",
-                Configuration.ApiUrl,
-                v => Configuration.ApiUrl = v);
-
-            AddInput(b, ref i, "API 端口（默认 9981，别改）",
+            AddInput(b, ref i, "API 端口（默认 9981）",
                 Configuration.Port.ToString(),
                 v =>
                 {
@@ -870,10 +1069,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             AddModeChip(b, ref i, 3, "Mode 3 · 双开");
             b.CloseElement();
 
-            AddLabel(b, ref i, "自动启动 AutoStart（新手必开）");
+            AddLabel(b, ref i, "自动启动 AutoStart");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-hint");
-            b.AddContent(i++, "开启后：打开桌宠时自动拉起 TTS 服务。关闭则需你手动启动或已有服务在跑。");
+            b.AddContent(i++, "开启后：打开桌宠时自动拉起 TTS 服务。若机械硬盘加载很慢，建议关闭它，改用上方「启动服务」手动控制。");
             b.CloseElement();
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-chip-row");
@@ -936,14 +1135,6 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 {
                     if (int.TryParse(v, out var n) && n > 0)
                         Configuration.WebPort = n;
-                });
-
-            AddInput(b, ref i, "流式切片 LimitCount（首包响应速度，默认 10）",
-                Configuration.LimitCount.ToString(),
-                v =>
-                {
-                    if (int.TryParse(v, out var n) && n > 0)
-                        Configuration.LimitCount = n;
                 });
 
             AddInput(b, ref i, "单次合成超时秒数（GPU 忙时可能卡住）",

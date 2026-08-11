@@ -33,6 +33,12 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private static readonly ConcurrentDictionary<string, string> FileCache = new();
         private static readonly ConcurrentDictionary<string, InFlightSynth> InFlight = new();
 
+        /// <summary>用户手动停止服务后，看门狗 / 自动恢复暂停（直到再次启动或重开桌宠）。</summary>
+        internal static volatile bool ManualStopActive;
+
+        /// <summary>跨进程共享：最近一次成功预热时间，避免多桌宠/多次开启重复合成「你好」。</summary>
+        private static long _lastWarmupUtcTicks;
+
         /// <summary>同句飞行合成：带等待方计数，无人等待时停止重试。</summary>
         private sealed class InFlightSynth
         {
@@ -50,6 +56,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private CosyVoiceSharedGate? _gate;
         private CancellationTokenSource? _watchdogCts;
         private Task? _watchdogTask;
+        /// <summary>「进程存活但未就绪」提示节流时间戳，避免每轮循环刷屏。</summary>
+        private long _lastLoadWarnUtcTicks;
         private readonly SemaphoreSlim _startLock = new(1, 1);
         // 进程内串行；跨进程由 Named Mutex 再串一层
         private readonly SemaphoreSlim _synthLock = new(1, 1);
@@ -105,6 +113,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             Configuration ??= new CosyVoiceSpeechModelConfig();
             NormalizeApiUrl();
 
+            // 重新开桌宠即代表用户想要语音：取消此前「手动停止」的抑制状态
+            if (Configuration.AutoStart)
+                ManualStopActive = false;
+
             _host = new CosyVoiceServiceHost(Configuration);
             _gate = new CosyVoiceSharedGate(Configuration.Port, Configuration.ProjectDir);
             _gate.RegisterClient();
@@ -117,6 +129,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 Log("检测到已有服务，复用中");
                 _ready = true;
                 _ownsProcess = false;
+                Interlocked.Exchange(ref _ttsFailStreak, 0);
                 EnsureValidSpeaker();
                 await WarmupAsync();
                 StartWatchdog();
@@ -152,11 +165,22 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     }
                     else if (!await ProbeReadyAsync(TimeSpan.FromSeconds(1)))
                     {
-                        // 健康失败时强制清理残留（含异常退出留下的 Python），再启动
-                        _host.ForceCleanup();
-                        _host.Start(bindJob: !Shared);
-                        _ownsProcess = true;
-                        Log(Shared ? "服务启动中…（共享，不绑定退出杀进程）" : "服务启动中…");
+                        // 端口已有存活进程但未就绪 → 视为正在加载（手动预加载/热重载），不打断
+                        bool portProcAlive = CosyVoiceServiceHost.IsPortInUse(Configuration.Port)
+                            && CosyVoiceServiceHost.IsPortProcessAlive(Configuration.Port);
+                        if (portProcAlive)
+                        {
+                            Log("检测到服务正在加载（端口进程存活），等待就绪，不打断预加载");
+                            _ownsProcess = false;
+                        }
+                        else
+                        {
+                            // 健康失败且无存活进程 → 清理僵尸残留后启动
+                            _host.ForceCleanup();
+                            _host.Start(bindJob: !Shared);
+                            _ownsProcess = true;
+                            Log(Shared ? "服务启动中…（共享，不绑定退出杀进程）" : "服务启动中…");
+                        }
                     }
                     else
                     {
@@ -169,56 +193,20 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     _startLock.Release();
                 }
 
-                bool ok = await WaitUntilReadyAsync(
-                    TimeSpan.FromSeconds(Math.Max(30, Configuration.ReadyTimeoutSeconds)));
-
+                // 不再同步等待就绪：先返回让桌宠激活立即完成，由看门狗后台轮询。
+                // 机械硬盘可能加载 10-20 分钟，同步等待会卡住激活流程。
+                bool ok = await ProbeReadyAsync(TimeSpan.FromSeconds(2));
                 if (ok)
                 {
                     _ready = true;
                     EnsureValidSpeaker();
-                    await WarmupAsync();
                     LogImportant($"服务就绪，音色 {_speakers.Length} 个");
                 }
-                else
+                else if (_host.IsProcessAlive)
                 {
-                    bool procAlive = _host?.IsProcessAlive == true;
-                    bool portUp = CosyVoiceServiceHost.IsPortInUse(Configuration.Port);
-
-                    // 进程已死 → 清理残留（PID 文件 / 僵尸端口）并自动重起一次
-                    if (!procAlive && (Configuration?.AutoStart ?? true) && _host != null)
-                    {
-                        LogWarn("服务进程已退出，清理残留并自动重启…");
-                        _host.ForceCleanup();
-                        await Task.Delay(1000).ConfigureAwait(false);
-                        _host.Start(bindJob: !Shared);
-                        _ownsProcess = true;
-
-                        ok = await WaitUntilReadyAsync(
-                            TimeSpan.FromSeconds(Math.Max(30, Configuration.ReadyTimeoutSeconds)));
-                        if (ok)
-                        {
-                            _ready = true;
-                            EnsureValidSpeaker();
-                            await WarmupAsync();
-                            LogImportant($"服务就绪（重启后），音色 {_speakers.Length} 个");
-                        }
-                        else
-                        {
-                            procAlive = _host?.IsProcessAlive == true;
-                            portUp = CosyVoiceServiceHost.IsPortInUse(Configuration.Port);
-                            LogWarn(
-                                $"{Configuration.ReadyTimeoutSeconds} 秒内未就绪" +
-                                $"（进程={(procAlive ? "在" : "已退出")}，端口{Configuration.Port}={(portUp ? "监听中" : "未监听")}），" +
-                                "请查看 [Cosy语音] 进程异常退出日志以及 ComfyUI 显存设置");
-                        }
-                    }
-                    else
-                    {
-                        LogWarn(
-                            $"{Configuration.ReadyTimeoutSeconds} 秒内未就绪" +
-                            $"（进程={(procAlive ? "在" : "已退出")}，端口{Configuration.Port}={(portUp ? "监听中" : "未监听")}），" +
-                            "后续请求将继续重试；请查看 [Cosy语音] 进程异常退出日志");
-                    }
+                    Log(Shared
+                        ? "服务启动中…（共享，后台加载，就绪后自动可用）"
+                        : "服务启动中…（后台加载，就绪后自动可用）");
                 }
             }
             catch (Exception ex)
@@ -242,25 +230,38 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 }
 
                 int remaining = _gate?.UnregisterClient() ?? 0;
+                // 手动启动的独立服务（不随桌宠/Alife 退出）→ 桌宠关闭时保留，避免带走用户预加载的服务
+                bool externalService = CosyVoiceServiceHost.ExternalMarkerExists(Configuration.ProjectDir);
 
                 if (Shared)
                 {
                     // 共享模式：仅最后一位存活客户端停服，避免关掉一个桌宠带走 TTS
-                    if (remaining <= 0)
+                    if (remaining <= 0 && !externalService)
                     {
                         LogImportant("共享模式：已无其他客户端，停止服务");
                         _host?.Stop();
                     }
                     else
                     {
-                        Log($"共享模式：仍有 {remaining} 个客户端，保留 TTS 进程");
+                        Log($"共享模式：仍有 {remaining} 个客户端{(externalService ? "，存在手动启动的独立服务" : "")}，保留 TTS 进程");
                         _host?.Detach();
                     }
                 }
                 else
                 {
-                    // 独占模式：正常退出停掉本插件拉起的服务
-                    _host?.Stop();
+                    // 独占模式：停掉本插件拉起的服务；手动启动/复用的独立服务不带走
+                    if (_ownsProcess && !externalService)
+                    {
+                        LogImportant("独占模式：停止本端拉起的服务");
+                        _host?.Stop();
+                    }
+                    else
+                    {
+                        Log(externalService
+                            ? "检测到手动启动的独立服务，桌宠退出不带走 TTS"
+                            : "服务非本端拉起，保留 TTS 进程");
+                        _host?.Detach();
+                    }
                 }
 
                 _gate?.Dispose();
@@ -273,6 +274,141 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             catch (Exception ex)
             {
                 LogWarn($"释放资源时异常：{ex.Message}");
+            }
+        }
+
+        #endregion
+
+        #region 手动服务控制（UI 开关；桌宠未启动时走静态路径）
+
+        /// <summary>
+        /// 手动启动服务（UI「启动服务」按钮，桌宠运行时调用）。
+        /// 按共享/独占语义绑定进程，与自动启动一致。
+        /// </summary>
+        public string ManualStart()
+        {
+            Configuration ??= new CosyVoiceSpeechModelConfig();
+            NormalizeApiUrl();
+            ManualStopActive = false;
+
+            if (_ready)
+                return "服务已在运行且就绪，无需重复启动。";
+
+            if (CosyVoiceServiceHost.IsPortInUse(Configuration.Port))
+                return $"端口 {Configuration.Port} 已被占用（可能正在加载中），请稍候或先用「停止服务」清理后重试。";
+
+            if (!ValidatePaths(out var pathError))
+                return "路径无效：" + pathError;
+
+            try
+            {
+                _startLock.Wait();
+                try
+                {
+                    _host ??= new CosyVoiceServiceHost(Configuration);
+                    _host.ForceCleanup();
+                    _host.Start(bindJob: !Shared);
+                    _ownsProcess = true;
+                    _ready = false;
+                    // 共享模式进程不绑 Job：标记为独立服务，桌宠关闭时不带走
+                    if (Shared)
+                        CosyVoiceServiceHost.MarkExternalService(Configuration.ProjectDir, _host.ProcessId);
+                }
+                finally
+                {
+                    _startLock.Release();
+                }
+                LogImportant($"手动启动（共享={Shared}），模型后台加载中…");
+                return "已启动 Cosy 服务，模型后台加载中（机械硬盘可能需较长时间，稍后可刷新状态查看）。";
+            }
+            catch (Exception ex)
+            {
+                LogError($"手动启动失败：{ex.Message}");
+                return "启动失败：" + ex.Message;
+            }
+        }
+
+        /// <summary>手动停止服务（UI「停止服务」按钮；会结束端口上的 TTS 进程）。</summary>
+        public string ManualStop()
+        {
+            ManualStopActive = true;
+            _ready = false;
+            try
+            {
+                CosyVoiceServiceHost.ClearExternalMarker(Configuration.ProjectDir);
+                _host?.Stop();
+                _ownsProcess = false;
+                LogImportant("已手动停止服务");
+                return "已停止 Cosy 服务。";
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"手动停止失败：{ex.Message}");
+                return "停止失败：" + ex.Message;
+            }
+        }
+
+        /// <summary>
+        /// 静态启动：桌宠未开启时也可用（配置页按钮）。
+        /// 不绑定 Alife 退出，适合机械硬盘用户先后台预加载模型再开桌宠。
+        /// </summary>
+        public static string StartService(CosyVoiceSpeechModelConfig config)
+        {
+            config ??= new CosyVoiceSpeechModelConfig();
+            NormalizeApiUrl(config);
+            ManualStopActive = false;
+
+            if (IsServiceHealthy(config, TimeSpan.FromSeconds(2)))
+                return $"服务已在运行且就绪（端口 {config.Port}）。";
+
+            if (CosyVoiceServiceHost.IsPortInUse(config.Port))
+                return $"端口 {config.Port} 已被占用（可能正在加载中），请稍候或先点「停止服务」清理后重试。";
+
+            if (!ValidatePaths(config, out var pathError))
+                return "路径无效：" + pathError;
+
+            try
+            {
+                var host = new CosyVoiceServiceHost(config);
+                host.ForceCleanup();
+                // 手动启动不绑 Job：关掉 Alife 也继续后台加载，适合机械硬盘预加载
+                host.Start(bindJob: false);
+                // 标记为独立服务：之后打开桌宠/关桌宠都不会带走它
+                CosyVoiceServiceHost.MarkExternalService(config.ProjectDir, host.ProcessId);
+                return "已启动 Cosy 服务，模型后台加载中（机械硬盘可能需较长时间，稍后可点「刷新状态」查看进度）。";
+            }
+            catch (Exception ex)
+            {
+                return "启动失败：" + ex.Message;
+            }
+        }
+
+        /// <summary>静态停止：桌宠未开启时也可用（配置页按钮）。</summary>
+        public static string StopService(CosyVoiceSpeechModelConfig config)
+        {
+            config ??= new CosyVoiceSpeechModelConfig();
+            ManualStopActive = true;
+            CosyVoiceServiceHost.ClearExternalMarker(config.ProjectDir);
+            return CosyVoiceServiceHost.CleanupOrphans(config);
+        }
+
+        /// <summary>服务是否就绪（/get_spk 可达）。静态探测，不依赖模块实例。</summary>
+        public static bool IsServiceHealthy(CosyVoiceSpeechModelConfig config, TimeSpan timeout)
+        {
+            config ??= new CosyVoiceSpeechModelConfig();
+            try
+            {
+                using var cts = new CancellationTokenSource(timeout);
+                using var http = new HttpClient { Timeout = timeout };
+                string baseUrl = string.IsNullOrWhiteSpace(config.ApiUrl)
+                    ? $"http://127.0.0.1:{config.Port}"
+                    : config.ApiUrl.TrimEnd('/');
+                using var resp = http.GetAsync(baseUrl + "/get_spk", cts.Token).GetAwaiter().GetResult();
+                return resp.IsSuccessStatusCode;
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -439,7 +575,9 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 {
                     LogWarn($"等待跨进程合成锁超时（{crossLockSec}s），放弃：「{Truncate(text, 40)}」");
                     NoteTtsFailure("跨进程合成锁超时");
-                    await TryRecoverAsync("跨进程合成锁超时", forceRestart: true)
+                    // 共享模式锁超时通常是对端桌宠正常占用 GPU，不强制重启以免打断对方；
+                    // 仅当本端是最后存活客户端时由 TryRecoverAsync 决定是否恢复
+                    await TryRecoverAsync("跨进程合成锁超时", forceRestart: false)
                         .ConfigureAwait(false);
                     return null;
                 }
@@ -632,6 +770,12 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             if (!forceRestart && fails < 3)
                 return;
 
+            if (ManualStopActive)
+            {
+                LogWarn("已手动停止服务，跳过自动恢复");
+                return;
+            }
+
             if (!(Configuration?.AutoStart ?? true) || _host == null)
                 return;
 
@@ -697,6 +841,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             _watchdogCts?.Cancel();
             _watchdogCts = new CancellationTokenSource();
             var ct = _watchdogCts.Token;
+            Interlocked.Exchange(ref _lastLoadWarnUtcTicks, DateTime.UtcNow.Ticks);
 
             _watchdogTask = Task.Run(async () =>
             {
@@ -748,7 +893,11 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         if (ok)
                         {
                             if (!_ready)
-                                LogImportant("服务已恢复");
+                            {
+                                LogImportant($"服务就绪，音色 {_speakers.Length} 个");
+                                try { EnsureValidSpeaker(); } catch { /* ignore */ }
+                                await WarmupAsync().ConfigureAwait(false);
+                            }
                             _ready = true;
                             failStreak = 0;
 
@@ -783,10 +932,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         if (failStreak == 1 || failStreak % 3 == 0)
                             LogWarn($"健康检查失败（连续 {failStreak} 次）");
 
-                        // 提高重启门槛，避免 500 抖动时杀进程
-                        int threshold = Math.Max(8, Configuration?.RestartAfterFailures ?? 8);
-                        if (failStreak >= threshold && (Configuration?.AutoStart ?? true) && _host != null)
+                        // 连续失败达到阈值才重启，避免 500 抖动时杀进程
+                        int threshold = Configuration?.RestartAfterFailures ?? 8;
+                        if (failStreak >= threshold && (Configuration?.AutoStart ?? true) && _host != null && !ManualStopActive)
                         {
+                            // 进程还活着（本端持有句柄或端口有存活进程，兼容复用/外部手动启动的服务）
+                            // → 视为仍在加载/恢复，不杀进程（机械硬盘首次加载可能很久）
+                            if (_host.IsProcessAlive || CosyVoiceServiceHost.IsPortProcessAlive(Configuration.Port))
+                            {
+                                if ((DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastLoadWarnUtcTicks), DateTimeKind.Utc)) > TimeSpan.FromMinutes(10))
+                                {
+                                    Interlocked.Exchange(ref _lastLoadWarnUtcTicks, DateTime.UtcNow.Ticks);
+                                    LogWarn("服务进程存活但未就绪，视为仍在加载（机械硬盘首次加载可能很慢），暂不重启");
+                                }
+                                failStreak = 0;
+                                continue;
+                            }
+
                             // 重启前再确认：若又开始合成 / 其它客户端仍在用则取消重启
                             if (IsBusySynthesizing ||
                                 RecentlySynthesized(TimeSpan.FromSeconds(30)) ||
@@ -939,12 +1101,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         private async Task WarmupAsync()
         {
+            // 10 分钟内已预热过（含其它桌宠）→ 跳过，避免重复占用 GPU 与机械硬盘 IO
+            long last = Interlocked.Read(ref _lastWarmupUtcTicks);
+            if (last > 0 && (DateTime.UtcNow - new DateTime(last, DateTimeKind.Utc)) < TimeSpan.FromMinutes(10))
+            {
+                Log("近期已预热过，跳过");
+                return;
+            }
+
             try
             {
                 string? path = await GenerateSpeechFileAsync("你好", CancellationToken.None)
                     .ConfigureAwait(false);
                 if (path != null)
+                {
+                    Interlocked.Exchange(ref _lastWarmupUtcTicks, DateTime.UtcNow.Ticks);
                     Log("预热完成");
+                }
                 else
                     LogWarn("预热未返回音频");
             }
@@ -975,22 +1148,30 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         #region 工具
 
-        private void NormalizeApiUrl()
+        private void NormalizeApiUrl() => NormalizeApiUrl(Configuration);
+
+        private static void NormalizeApiUrl(CosyVoiceSpeechModelConfig? config)
         {
-            if (Configuration == null) return;
-            string expected = $"http://127.0.0.1:{Configuration.Port}";
-            if (string.IsNullOrWhiteSpace(Configuration.ApiUrl) ||
-                Configuration.ApiUrl.Contains("127.0.0.1") ||
-                Configuration.ApiUrl.Contains("localhost"))
+            if (config == null) return;
+            string expected = $"http://127.0.0.1:{config.Port}";
+            if (string.IsNullOrWhiteSpace(config.ApiUrl) ||
+                config.ApiUrl.Contains("127.0.0.1") ||
+                config.ApiUrl.Contains("localhost"))
             {
-                Configuration.ApiUrl = expected;
+                config.ApiUrl = expected;
             }
         }
 
-        private bool ValidatePaths(out string error)
+        private bool ValidatePaths(out string error) => ValidatePaths(Configuration, out error);
+
+        private static bool ValidatePaths(CosyVoiceSpeechModelConfig? cfg, out string error)
         {
             error = "";
-            var cfg = Configuration!;
+            if (cfg == null)
+            {
+                error = "配置为空";
+                return false;
+            }
             if (!File.Exists(cfg.PythonPath))
             {
                 error = $"Python 不存在：{cfg.PythonPath}";
@@ -1128,6 +1309,64 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         /// <summary>端口是否处于 LISTENING（供就绪诊断）。</summary>
         public static bool IsPortInUse(int port) => IsPortListening(port);
 
+        /// <summary>端口上是否还有存活进程（用于区分「加载中」与「僵尸占端口」）。</summary>
+        public static bool IsPortProcessAlive(int port)
+        {
+            if (port <= 0) return false;
+            try
+            {
+                foreach (int pid in GetPidsListeningOnPort(port))
+                {
+                    try
+                    {
+                        using var p = Process.GetProcessById(pid);
+                        if (!p.HasExited) return true;
+                    }
+                    catch (ArgumentException) { }
+                    catch { /* ignore */ }
+                }
+            }
+            catch { /* ignore */ }
+            return false;
+        }
+
+        /// <summary>手动启动的独立服务标记文件（存在=服务不随桌宠/Alife 退出）。</summary>
+        public static string ExternalMarkerPath(string? projectDir)
+            => !string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir)
+                ? Path.Combine(projectDir, ".cosyvoice_alife_external")
+                : Path.Combine(Path.GetTempPath(), ".cosyvoice_alife_external");
+
+        public static bool ExternalMarkerExists(string? projectDir)
+        {
+            try { return File.Exists(ExternalMarkerPath(projectDir)); }
+            catch { return false; }
+        }
+
+        public static void MarkExternalService(string? projectDir, int pid)
+        {
+            try { File.WriteAllText(ExternalMarkerPath(projectDir), pid.ToString()); }
+            catch { /* ignore */ }
+        }
+
+        public static void ClearExternalMarker(string? projectDir)
+        {
+            try { if (File.Exists(ExternalMarkerPath(projectDir))) File.Delete(ExternalMarkerPath(projectDir)); }
+            catch { /* ignore */ }
+        }
+
+        /// <summary>本实例持有的 Python 进程 PID（未持有返回 0）。</summary>
+        public int ProcessId
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    try { return _process?.Id ?? 0; }
+                    catch { return 0; }
+                }
+            }
+        }
+
         /// <param name="bindJob">
         /// true=绑定 KillOnClose Job（独占）；false=共享模式不绑，避免一个桌宠退出带走 TTS。
         /// </param>
@@ -1162,7 +1401,6 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     $"--model_dir \"{_config.ModelDir}\" " +
                     $"--port {_config.Port} " +
                     $"--webport {_config.WebPort} " +
-                    $"--limit_count {_config.LimitCount} " +
                     $"--mode {mode}";
 
                 _stderr.Clear();
@@ -1313,6 +1551,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             var host = new CosyVoiceServiceHost(config);
             int killed = host.ForceCleanup();
+            ClearExternalMarker(config.ProjectDir);
             int cleared = CosyVoiceSharedGate.ClearStaleFiles(port, config.ProjectDir);
 
             bool portStill = IsPortListening(port);

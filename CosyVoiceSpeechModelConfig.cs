@@ -33,12 +33,6 @@ public class CosyVoiceSpeechModelConfig
     public int WebPort { get; set; } = 9980;
 
     /// <summary>
-    /// 流式切片字符数（limit_count）。
-    /// 越小首包越快但后续更易卡顿；非流式时影响较小。
-    /// </summary>
-    public int LimitCount { get; set; } = 10;
-
-    /// <summary>
     /// 启动模式：1=仅 API（推荐，省资源），2=仅 WebUI，3=API+WebUI。
     /// </summary>
     public int Mode { get; set; } = 1;
@@ -58,8 +52,8 @@ public class CosyVoiceSpeechModelConfig
     /// <summary>等待服务就绪的最长时间（秒）。</summary>
     public int ReadyTimeoutSeconds { get; set; } = 180;
 
-    /// <summary>健康检查失败多少次后重启服务。</summary>
-    public int RestartAfterFailures { get; set; } = 6;
+    /// <summary>健康检查连续失败多少次后重启服务。</summary>
+    public int RestartAfterFailures { get; set; } = 8;
 
     /// <summary>等待进程内/跨进程合成锁的最长时间（秒），超时放弃本次合成并触发恢复。</summary>
     public int SynthLockTimeoutSeconds { get; set; } = 60;
