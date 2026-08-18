@@ -63,4 +63,14 @@ public class CosyVoiceSpeechModelConfig
     /// 日常合成过程日志全部静默；关闭则输出完整调试日志。
     /// </summary>
     public bool QuietLog { get; set; } = true;
+
+    // === 空闲工作集修剪（借鉴 GptSovits：EmptyWorkingSet 只压物理 RSS，不碰显存）===
+    /// <summary>空闲超阈值后把 TTS 进程物理内存（Working Set）压回分页文件。只降 RAM，不释放显存。</summary>
+    public bool EnableIdleWorkingSetTrim { get; set; } = true;
+
+    /// <summary>连续空闲（无合成/无播放）多少分钟后触发剪枝。</summary>
+    public int IdleWorkingSetTrimMinutes { get; set; } = 10;
+
+    /// <summary>空闲监控轮询间隔（秒，5-300；不暴露 UI，可在配置 JSON 调整）。</summary>
+    public int IdleTrimPollSeconds { get; set; } = 20;
 }

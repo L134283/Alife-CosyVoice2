@@ -1169,6 +1169,36 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         Configuration.SynthLockTimeoutSeconds = n;
                 });
 
+            // ---- 内存优化 ----
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-section");
+            b.OpenElement(i++, "span");
+            b.AddAttribute(i++, "class", "cv-section-icon");
+            b.AddContent(i++, "\u26F6");
+            b.CloseElement();
+            b.AddContent(i++, "内存优化（空闲剪枝）");
+            b.CloseElement();
+
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-hint");
+            b.AddContent(i++, "空闲超阈值后把 TTS 进程物理内存压回分页文件（只降 RAM，不释放显存；下次合成自动调入，不损伤音质）。");
+            b.CloseElement();
+
+            AddLabel(b, ref i, "空闲时修剪 TTS 进程工作集（省内存）");
+            b.OpenElement(i++, "div");
+            b.AddAttribute(i++, "class", "cv-chip-row");
+            AddIdleTrimChip(b, ref i, true, "开启 · 空闲剪枝（推荐）");
+            AddIdleTrimChip(b, ref i, false, "关闭");
+            b.CloseElement();
+
+            AddInput(b, ref i, "空闲多久后触发剪枝（分钟，默认 10）",
+                Configuration.IdleWorkingSetTrimMinutes.ToString(),
+                v =>
+                {
+                    if (int.TryParse(v, out var n) && n >= 1)
+                        Configuration.IdleWorkingSetTrimMinutes = n;
+                });
+
             // footer
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-footer");
@@ -1239,6 +1269,21 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
             {
                 Configuration.QuietLog = value;
+                StateHasChanged();
+            }));
+            b.AddContent(seq++, label);
+            b.CloseElement();
+        }
+
+        private void AddIdleTrimChip(RenderTreeBuilder b, ref int seq, bool value, string label)
+        {
+            bool on = Configuration!.EnableIdleWorkingSetTrim == value;
+            b.OpenElement(seq++, "button");
+            b.AddAttribute(seq++, "type", "button");
+            b.AddAttribute(seq++, "class", on ? "cv-chip cv-chip-on" : "cv-chip");
+            b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () =>
+            {
+                Configuration.EnableIdleWorkingSetTrim = value;
                 StateHasChanged();
             }));
             b.AddContent(seq++, label);

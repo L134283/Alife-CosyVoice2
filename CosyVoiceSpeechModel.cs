@@ -63,6 +63,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private readonly SemaphoreSlim _synthLock = new(1, 1);
         private int _activeSynth;
         private long _lastSynthUtcTicks = DateTime.UtcNow.Ticks;
+
+        // === 空闲工作集修剪（借鉴 GptSovits：空闲时 EmptyWorkingSet 压回物理内存）===
+        private readonly object _idleGate = new();
+        private long _lastTtsDemandUtcTicks = DateTime.UtcNow.Ticks;
+        private volatile bool _idleTrimmed;
+        private CancellationTokenSource? _idleTrimCts;
+        private Task? _idleTrimTask;
         private long _synthHoldStartedUtcTicks;
         private volatile bool _ready;
         private volatile bool _ownsProcess;
@@ -215,6 +222,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
 
             StartWatchdog();
+            StartIdleTrimMonitor();
         }
 
         protected override async Task OnDestroy()
@@ -228,6 +236,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     catch (OperationCanceledException) { }
                     catch { /* ignore */ }
                 }
+
+                StopIdleTrimMonitor();
 
                 int remaining = _gate?.UnregisterClient() ?? 0;
                 // 手动启动的独立服务（不随桌宠/Alife 退出）→ 桌宠关闭时保留，避免带走用户预加载的服务
@@ -425,6 +435,13 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             Configuration ??= new CosyVoiceSpeechModelConfig();
             NormalizeApiUrl();
+
+            // 空闲剪枝：有合成需求即视为「非空闲」，复位修剪标志 + 记录需求时间
+            lock (_idleGate)
+            {
+                _lastTtsDemandUtcTicks = DateTime.UtcNow.Ticks;
+                _idleTrimmed = false;
+            }
 
             text = text.Trim();
             // Cosy 对纯标点/空白会稳定 500，合成前直接跳过
@@ -1021,6 +1038,87 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }, ct);
         }
 
+        // ===== 空闲工作集修剪（借鉴 GptSovits：EmptyWorkingSet 只压物理 RSS，不碰显存）=====
+
+        /// <summary>启动空闲剪枝监控：周期性检查 TTS 进程，空闲超阈值则把工作集压回分页文件。</summary>
+        private void StartIdleTrimMonitor()
+        {
+            if (_idleTrimTask != null)
+                return;
+            _idleTrimCts = CancellationTokenSource.CreateLinkedTokenSource(
+                _watchdogCts?.Token ?? CancellationToken.None);
+            _idleTrimTask = Task.Run(() => IdleTrimLoopAsync(_idleTrimCts.Token), CancellationToken.None);
+        }
+
+        /// <summary>停止空闲剪枝监控。</summary>
+        private void StopIdleTrimMonitor()
+        {
+            try { _idleTrimCts?.Cancel(); } catch { }
+            if (_idleTrimTask != null)
+            {
+                try { _idleTrimTask.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            }
+            try { _idleTrimCts?.Dispose(); } catch { }
+            _idleTrimCts = null;
+            _idleTrimTask = null;
+        }
+
+        private async Task IdleTrimLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                int poll = Math.Clamp(Configuration?.IdleTrimPollSeconds ?? 20, 5, 300);
+                try { await Task.Delay(TimeSpan.FromSeconds(poll), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { break; }
+                TryTrimWorkingSet();
+            }
+        }
+
+        private void TryTrimWorkingSet()
+        {
+            var cfg = Configuration;
+            if (cfg == null || !cfg.EnableIdleWorkingSetTrim)
+                return;
+
+            // 只修剪本端实际持有句柄的进程；复用/外部手动启动的进程不碰
+            if (!_ownsProcess || _host == null || !_host.IsProcessAlive)
+                return;
+
+            // 已剪过且期间无新需求 → 不再重复剪
+            if (_idleTrimmed)
+                return;
+
+            // 正在合成 / 其它桌宠正在合成 → 不动
+            if (IsBusySynthesizing || (_gate?.IsSynthBusyElsewhere() ?? false))
+                return;
+
+            // 距最近一次合成或需求超过阈值分钟才剪
+            long now = DateTime.UtcNow.Ticks;
+            long synthIdle = now - Interlocked.Read(ref _lastSynthUtcTicks);
+            long demandIdle = now - _lastTtsDemandUtcTicks;
+            long minIdle = (long)Math.Clamp(cfg.IdleWorkingSetTrimMinutes, 1, 720) * TimeSpan.TicksPerMinute;
+            if (synthIdle < minIdle || demandIdle < minIdle)
+                return;
+
+            lock (_idleGate)
+            {
+                _idleTrimmed = true;
+            }
+
+            try
+            {
+                long before = _host.TrimWorkingSet();
+                if (before > 0)
+                {
+                    LogImportant($"空闲剪枝：TTS 进程工作集已压回分页文件（before {before / 1048576d:F1} MiB）；显存不变");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"空闲工作集修剪失败：{ex.Message}");
+            }
+        }
+
         private async Task<bool> HealthCheckAsync(CancellationToken ct = default)
         {
             // 合成占用时健康检查易超时/失败，直接视为暂态 OK
@@ -1367,6 +1465,38 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
         }
 
+        // ===== 空闲工作集修剪（借鉴 GptSovits：EmptyWorkingSet 只压物理 RSS，不碰显存）=====
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+        /// <summary>
+        /// 把本实例持有的 TTS 进程物理内存（Working Set）压回分页文件。
+        /// 只降 RAM，不释放显存；下次合成会自动重新调入。返回修剪前工作集字节数，失败返回 0。
+        /// </summary>
+        public long TrimWorkingSet()
+        {
+            lock (_lock)
+            {
+                if (_process == null)
+                    return 0;
+                try
+                {
+                    if (_process.HasExited)
+                        return 0;
+                    _process.Refresh();
+                    long before = _process.WorkingSet64;
+                    if (!EmptyWorkingSet(_process.Handle))
+                        return 0;
+                    return before;
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+        }
+
         /// <param name="bindJob">
         /// true=绑定 KillOnClose Job（独占）；false=共享模式不绑，避免一个桌宠退出带走 TTS。
         /// </param>
@@ -1430,6 +1560,9 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 // 稳延迟：限制 CPU 线程争抢，不伤 GPU 推理主路径
                 _process.StartInfo.Environment["OMP_NUM_THREADS"] = "4";
                 _process.StartInfo.Environment["MKL_NUM_THREADS"] = "4";
+                // 内存优化：CUDA 模块按需加载（PyTorch 官方推荐），减少库常驻内存；MKL 动态分配线程缓冲
+                _process.StartInfo.Environment["CUDA_MODULE_LOADING"] = "LAZY";
+                _process.StartInfo.Environment["MKL_DYNAMIC"] = "TRUE";
                 // 与 start.bat 一致：把项目自带 ffmpeg 放进 PATH，避免部分音频处理失败
                 try
                 {
