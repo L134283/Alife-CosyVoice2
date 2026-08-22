@@ -14,17 +14,22 @@ public class CosyVoiceSpeechModelConfig
     /// <summary>风格指令，如「用开心的语气说」；留空则不传。</summary>
     public string Instruct { get; set; } = "";
 
-    /// <summary>yinmei-cosyvoice 自带 Python 解释器路径。</summary>
-    public string PythonPath { get; set; }
-        = @"D:\1TTS\yinmei-cosyvoice\python311\python.exe";
+    /// <summary>
+    /// yinmei-cosyvoice 自带 Python 解释器路径。默认留空，需在配置 UI 填写，
+    /// 路径示例见 README「依赖与环境」。
+    /// </summary>
+    public string PythonPath { get; set; } = "";
 
-    /// <summary>yinmei-cosyvoice 项目根目录。</summary>
-    public string ProjectDir { get; set; }
-        = @"D:\1TTS\yinmei-cosyvoice";
+    /// <summary>
+    /// yinmei-cosyvoice 项目根目录（含 start.py）。默认留空，需在配置 UI 填写。
+    /// </summary>
+    public string ProjectDir { get; set; } = "";
 
-    /// <summary>CosyVoice2 模型目录。</summary>
-    public string ModelDir { get; set; }
-        = @"D:\1TTS\yinmei-cosyvoice\pretrained_models\CosyVoice2-0.5B";
+    /// <summary>
+    /// CosyVoice2 模型目录，通常是 项目目录\pretrained_models\CosyVoice2-0.5B。
+    /// 默认留空，需在配置 UI 填写。
+    /// </summary>
+    public string ModelDir { get; set; } = "";
 
     /// <summary>API 端口。</summary>
     public int Port { get; set; } = 9981;
@@ -65,12 +70,30 @@ public class CosyVoiceSpeechModelConfig
     public bool QuietLog { get; set; } = true;
 
     // === 空闲工作集修剪（借鉴 GptSovits：EmptyWorkingSet 只压物理 RSS，不碰显存）===
-    /// <summary>空闲超阈值后把 TTS 进程物理内存（Working Set）压回分页文件。只降 RAM，不释放显存。</summary>
+    /// <summary>
+    /// 空闲超阈值后把 TTS 进程物理内存（Working Set）压回分页文件。
+    /// 采用「同一进程仅剪一次」策略：剪一次把模型加载时的高工作集压下去后，
+    /// 后续合成工作集不会再涨回高位，因此不重复剪枝，避免 pagefile 反复膨胀。
+    /// </summary>
     public bool EnableIdleWorkingSetTrim { get; set; } = true;
 
-    /// <summary>连续空闲（无合成/无播放）多少分钟后触发剪枝。</summary>
+    /// <summary>连续空闲（无合成/无播放）多少分钟后触发首次剪枝。</summary>
     public int IdleWorkingSetTrimMinutes { get; set; } = 10;
 
+    /// <summary>工作集低于该值（MiB）不剪枝，避免对已很低的工作集做无意义修剪。</summary>
+    public int IdleTrimMinWorkingSetMiB { get; set; } = 512;
+
     /// <summary>空闲监控轮询间隔（秒，5-300；不暴露 UI，可在配置 JSON 调整）。</summary>
-    public int IdleTrimPollSeconds { get; set; } = 20;
+    public int IdleTrimPollSeconds { get; set; } = 30;
+
+    // === 同句缓存清理 ===
+
+    /// <summary>
+    /// 同句缓存 wav 最大保留条数，超出后按最旧优先清理；0 = 不限条数。
+    /// 由看门狗每小时清理一次。
+    /// </summary>
+    public int CacheMaxFiles { get; set; } = 300;
+
+    /// <summary>同句缓存 wav 最大保留时长（小时），过期自动删除；0 = 不按时间清理。</summary>
+    public int CacheMaxAgeHours { get; set; } = 72;
 }

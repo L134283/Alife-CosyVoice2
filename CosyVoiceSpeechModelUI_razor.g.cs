@@ -1181,10 +1181,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-hint");
-            b.AddContent(i++, "空闲超阈值后把 TTS 进程物理内存压回分页文件（只降 RAM，不释放显存；下次合成自动调入，不损伤音质）。");
+            b.AddContent(i++, "同一进程仅剪一次：把模型加载时的高工作集压回分页文件后，后续合成工作集不会涨回高位，因此不重复剪枝（避免 pagefile 反复膨胀爆内存）。进程重启后允许再剪一次。");
             b.CloseElement();
 
-            AddLabel(b, ref i, "空闲时修剪 TTS 进程工作集（省内存）");
+            AddLabel(b, ref i, "空闲时修剪 TTS 进程工作集（同一进程仅一次）");
             b.OpenElement(i++, "div");
             b.AddAttribute(i++, "class", "cv-chip-row");
             AddIdleTrimChip(b, ref i, true, "开启 · 空闲剪枝（推荐）");

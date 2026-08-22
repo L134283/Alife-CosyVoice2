@@ -36,9 +36,6 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         /// <summary>用户手动停止服务后，看门狗 / 自动恢复暂停（直到再次启动或重开桌宠）。</summary>
         internal static volatile bool ManualStopActive;
 
-        /// <summary>跨进程共享：最近一次成功预热时间，避免多桌宠/多次开启重复合成「你好」。</summary>
-        private static long _lastWarmupUtcTicks;
-
         /// <summary>同句飞行合成：带等待方计数，无人等待时停止重试。</summary>
         private sealed class InFlightSynth
         {
@@ -58,6 +55,8 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         private Task? _watchdogTask;
         /// <summary>「进程存活但未就绪」提示节流时间戳，避免每轮循环刷屏。</summary>
         private long _lastLoadWarnUtcTicks;
+        /// <summary>上次缓存清理时间，看门狗按小时级节流。</summary>
+        private long _lastCacheSweepUtcTicks;
         private readonly SemaphoreSlim _startLock = new(1, 1);
         // 进程内串行；跨进程由 Named Mutex 再串一层
         private readonly SemaphoreSlim _synthLock = new(1, 1);
@@ -67,6 +66,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         // === 空闲工作集修剪（借鉴 GptSovits：空闲时 EmptyWorkingSet 压回物理内存）===
         private readonly object _idleGate = new();
         private long _lastTtsDemandUtcTicks = DateTime.UtcNow.Ticks;
+        private int _trimmedProcessId;          // 已剪枝的进程 PID（同一进程只剪一次）
         private volatile bool _idleTrimmed;
         private CancellationTokenSource? _idleTrimCts;
         private Task? _idleTrimTask;
@@ -79,7 +79,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         public IReadOnlyList<string> Speakers => _speakers;
         public bool IsReady => _ready;
 
-        private bool Shared => Configuration?.SharedService ?? true;
+        private bool Shared => Configuration?.SharedService ?? false;
         private bool IsBusySynthesizing => Volatile.Read(ref _activeSynth) > 0;
         private bool RecentlySynthesized(TimeSpan window)
             => (DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastSynthUtcTicks), DateTimeKind.Utc)) < window;
@@ -239,6 +239,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                 StopIdleTrimMonitor();
 
+                // 等飞行合成收尾（最多 5s）后再清理共享门，避免合成中的跨进程锁操作撞上已释放的 Mutex
+                for (int i = 0; i < 50 && !InFlight.IsEmpty; i++)
+                    await Task.Delay(100).ConfigureAwait(false);
+
                 int remaining = _gate?.UnregisterClient() ?? 0;
                 // 手动启动的独立服务（不随桌宠/Alife 退出）→ 桌宠关闭时保留，避免带走用户预加载的服务
                 bool externalService = CosyVoiceServiceHost.ExternalMarkerExists(Configuration.ProjectDir);
@@ -276,9 +280,11 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
                 _gate?.Dispose();
                 _gate = null;
-                _http.Dispose();
-                _startLock.Dispose();
-                _synthLock.Dispose();
+
+                // 故意不 Dispose _http/_startLock/_synthLock：插件热重载后，框架构造注入的消费者
+                // （如 SpeechService）可能仍持有本实例引用，迟到的合成调用撞上已释放对象会直接抛
+                // ObjectDisposedException（实测 2026-08-22 日志可复现）。保留可用状态让迟到调用
+                // 照常完成合成；未释放的句柄量级极小（仅开发期热重载产生），交给 GC / 进程退出回收。
                 _watchdogCts?.Dispose();
             }
             catch (Exception ex)
@@ -312,7 +318,9 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             try
             {
-                _startLock.Wait();
+                // 有界等待：看门狗重启服务期间持锁可达数十秒，不设上限会长期占住线程池线程
+                if (!_startLock.Wait(TimeSpan.FromSeconds(30)))
+                    return "服务正在启动/重启中，请稍后再试。";
                 try
                 {
                     _host ??= new CosyVoiceServiceHost(Configuration);
@@ -436,11 +444,11 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             Configuration ??= new CosyVoiceSpeechModelConfig();
             NormalizeApiUrl();
 
-            // 空闲剪枝：有合成需求即视为「非空闲」，复位修剪标志 + 记录需求时间
+            // 空闲剪枝：有合成需求即视为「非空闲」，记录需求时间（剪枝标志不复位：
+            // 同一进程只剪一次，避免反复换页导致 pagefile 膨胀）
             lock (_idleGate)
             {
                 _lastTtsDemandUtcTicks = DateTime.UtcNow.Ticks;
-                _idleTrimmed = false;
             }
 
             text = text.Trim();
@@ -457,7 +465,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             string instruct = Configuration.Instruct?.Trim() ?? "";
             float speed = Configuration.Speed <= 0 ? 1.0f : Configuration.Speed;
 
-            string hash = ComputeHash(text, spkid, speed, instruct, Configuration.ApiUrl);
+            string hash = ComputeHash(text, spkid, speed, instruct);
             string outputPath = Path.Combine(AlifePath.TempFolderPath, $"cosy_{hash}.wav");
 
             if (File.Exists(outputPath))
@@ -563,15 +571,24 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             // 进程内串行：带超时，避免前一请求 GPU 挂死后后面无限转圈
             Log($"等待进程内合成锁（最多 {lockTimeoutSec}s）…");
-            if (!await _synthLock.WaitAsync(TimeSpan.FromSeconds(lockTimeoutSec), cancellationToken)
-                    .ConfigureAwait(false))
+            try
             {
-                LogWarn($"等待进程内合成锁超时（{lockTimeoutSec}s），放弃：「{Truncate(text, 40)}」");
+                if (!await _synthLock.WaitAsync(TimeSpan.FromSeconds(lockTimeoutSec), cancellationToken)
+                        .ConfigureAwait(false))
+                {
+                    LogWarn($"等待进程内合成锁超时（{lockTimeoutSec}s），放弃：「{Truncate(text, 40)}」");
+                    Interlocked.Decrement(ref _activeSynth);
+                    NoteTtsFailure("进程内合成锁超时");
+                    await TryRecoverAsync("进程内合成锁超时", forceRestart: true)
+                        .ConfigureAwait(false);
+                    return null;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // 排队等锁期间被取消：必须回滚计数，否则 IsBusySynthesizing 永久为真，看门狗失明
                 Interlocked.Decrement(ref _activeSynth);
-                NoteTtsFailure("进程内合成锁超时");
-                await TryRecoverAsync("进程内合成锁超时", forceRestart: true)
-                    .ConfigureAwait(false);
-                return null;
+                throw;
             }
             lockHeld = true;
             Interlocked.Exchange(ref _synthHoldStartedUtcTicks, DateTime.UtcNow.Ticks);
@@ -580,24 +597,24 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             IDisposable? crossProcHold = null;
             try
             {
-            if (Shared && _gate != null)
-            {
-                // 跨进程锁超时不宜太长：刚启动或上次崩溃后可能残留死锁，10s 足够判断
-                int crossLockSec = 10;
-                Log($"等待跨进程合成锁（最多 {crossLockSec}s）…");
-                crossProcHold = await _gate
-                    .AcquireSynthAsync(TimeSpan.FromSeconds(crossLockSec), cancellationToken)
-                    .ConfigureAwait(false);
-                if (crossProcHold == null)
+                if (Shared && _gate != null)
                 {
-                    LogWarn($"等待跨进程合成锁超时（{crossLockSec}s），放弃：「{Truncate(text, 40)}」");
-                    NoteTtsFailure("跨进程合成锁超时");
-                    // 共享模式锁超时通常是对端桌宠正常占用 GPU，不强制重启以免打断对方；
-                    // 仅当本端是最后存活客户端时由 TryRecoverAsync 决定是否恢复
-                    await TryRecoverAsync("跨进程合成锁超时", forceRestart: false)
+                    // 跨进程锁超时不宜太长：刚启动或上次崩溃后可能残留死锁，10s 足够判断
+                    int crossLockSec = 10;
+                    Log($"等待跨进程合成锁（最多 {crossLockSec}s）…");
+                    crossProcHold = await _gate
+                        .AcquireSynthAsync(TimeSpan.FromSeconds(crossLockSec), cancellationToken)
                         .ConfigureAwait(false);
-                    return null;
-                }
+                    if (crossProcHold == null)
+                    {
+                        LogWarn($"等待跨进程合成锁超时（{crossLockSec}s），放弃：「{Truncate(text, 40)}」");
+                        NoteTtsFailure("跨进程合成锁超时");
+                        // 共享模式锁超时通常是对端桌宠正常占用 GPU，不强制重启以免打断对方；
+                        // 仅当本端是最后存活客户端时由 TryRecoverAsync 决定是否恢复
+                        await TryRecoverAsync("跨进程合成锁超时", forceRestart: false)
+                            .ConfigureAwait(false);
+                        return null;
+                    }
                     // 跨进程锁到手后刷新持锁起点（真正开始占用全局合成权）
                     Interlocked.Exchange(ref _synthHoldStartedUtcTicks, DateTime.UtcNow.Ticks);
                     Interlocked.Exchange(ref _lastSynthUtcTicks, DateTime.UtcNow.Ticks);
@@ -855,10 +872,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         private void StartWatchdog()
         {
-            _watchdogCts?.Cancel();
+            var oldCts = _watchdogCts;
+            var oldTask = _watchdogTask;
+            if (oldCts != null)
+            {
+                try { oldCts.Cancel(); } catch { /* ignore */ }
+                // 后台等旧循环退出后再释放其 CTS：避免重入时的双看门狗窗口与 CTS 泄漏
+                _ = Task.Run(() =>
+                {
+                    try { oldTask?.Wait(TimeSpan.FromSeconds(5)); } catch { /* ignore */ }
+                    try { oldCts.Dispose(); } catch { /* ignore */ }
+                });
+            }
+
             _watchdogCts = new CancellationTokenSource();
             var ct = _watchdogCts.Token;
             Interlocked.Exchange(ref _lastLoadWarnUtcTicks, DateTime.UtcNow.Ticks);
+            Interlocked.Exchange(ref _lastCacheSweepUtcTicks, DateTime.UtcNow.Ticks);
 
             _watchdogTask = Task.Run(async () =>
             {
@@ -882,6 +912,15 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                         // 共享模式心跳：避免其它桌宠误判本端已退出
                         if (Shared)
                             _gate?.RegisterClient();
+
+                        // 周期清理过期同句缓存 wav（节流 1 小时）
+                        if ((DateTime.UtcNow - new DateTime(
+                                Interlocked.Read(ref _lastCacheSweepUtcTicks), DateTimeKind.Utc))
+                            > TimeSpan.FromHours(1))
+                        {
+                            Interlocked.Exchange(ref _lastCacheSweepUtcTicks, DateTime.UtcNow.Ticks);
+                            SweepCache();
+                        }
 
                         int lockTimeoutSec = Math.Clamp(Configuration?.SynthLockTimeoutSeconds ?? 60, 10, 180);
                         var stuckLimit = TimeSpan.FromSeconds(lockTimeoutSec + 30);
@@ -1084,25 +1123,40 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             if (!_ownsProcess || _host == null || !_host.IsProcessAlive)
                 return;
 
-            // 已剪过且期间无新需求 → 不再重复剪
-            if (_idleTrimmed)
-                return;
-
             // 正在合成 / 其它桌宠正在合成 → 不动
             if (IsBusySynthesizing || (_gate?.IsSynthBusyElsewhere() ?? false))
                 return;
 
-            // 距最近一次合成或需求超过阈值分钟才剪
             long now = DateTime.UtcNow.Ticks;
+
+            // 同一进程只剪一次：剪枝后即使继续合成也不再剪（工作集不会再涨回高位）
+            int pid = _host.ProcessId;
+            lock (_idleGate)
+            {
+                if (_idleTrimmed && pid == _trimmedProcessId)
+                    return;
+                // 进程重启（PID 变化）→ 允许对新的进程再剪一次
+                if (_idleTrimmed && pid != _trimmedProcessId)
+                    _idleTrimmed = false;
+            }
+
+            // 距最近一次合成或需求超过阈值分钟才剪
             long synthIdle = now - Interlocked.Read(ref _lastSynthUtcTicks);
-            long demandIdle = now - _lastTtsDemandUtcTicks;
+            long demandIdle = now - Interlocked.Read(ref _lastTtsDemandUtcTicks);
             long minIdle = (long)Math.Clamp(cfg.IdleWorkingSetTrimMinutes, 1, 720) * TimeSpan.TicksPerMinute;
             if (synthIdle < minIdle || demandIdle < minIdle)
+                return;
+
+            // 工作集已很低则不剪（避免无意义修剪）
+            long minWs = (long)Math.Max(0, cfg.IdleTrimMinWorkingSetMiB) * 1048576;
+            long currentWs = _host.GetWorkingSetSize();
+            if (currentWs <= 0 || currentWs < minWs)
                 return;
 
             lock (_idleGate)
             {
                 _idleTrimmed = true;
+                _trimmedProcessId = pid;
             }
 
             try
@@ -1110,11 +1164,17 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 long before = _host.TrimWorkingSet();
                 if (before > 0)
                 {
-                    LogImportant($"空闲剪枝：TTS 进程工作集已压回分页文件（before {before / 1048576d:F1} MiB）；显存不变");
+                    LogImportant($"空闲剪枝：TTS 进程工作集已压回分页文件（before {before / 1048576d:F1} MiB）；同一进程仅剪一次，后续合成不再重复修剪");
+                }
+                else
+                {
+                    // 剪枝失败/无进程 → 复位标志，允许下次重试
+                    lock (_idleGate) { _idleTrimmed = false; }
                 }
             }
             catch (Exception ex)
             {
+                lock (_idleGate) { _idleTrimmed = false; }
                 LogWarn($"空闲工作集修剪失败：{ex.Message}");
             }
         }
@@ -1199,9 +1259,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
         private async Task WarmupAsync()
         {
-            // 10 分钟内已预热过（含其它桌宠）→ 跳过，避免重复占用 GPU 与机械硬盘 IO
-            long last = Interlocked.Read(ref _lastWarmupUtcTicks);
-            if (last > 0 && (DateTime.UtcNow - new DateTime(last, DateTimeKind.Utc)) < TimeSpan.FromMinutes(10))
+            // 10 分钟内已预热过（跨进程标记文件，多桌宠/多次开启共享）→ 跳过，避免重复占用 GPU
+            DateTime? last = CosyVoiceSharedGate.GetLastWarmupUtc(
+                Configuration?.Port ?? 0, Configuration?.ProjectDir);
+            if (last.HasValue && (DateTime.UtcNow - last.Value) < TimeSpan.FromMinutes(10))
             {
                 Log("近期已预热过，跳过");
                 return;
@@ -1209,11 +1270,23 @@ namespace Alife.Function.Speech.CosyVoiceTTS
 
             try
             {
-                string? path = await GenerateSpeechFileAsync("你好", CancellationToken.None)
-                    .ConfigureAwait(false);
+                // 预热必须真打一次推理：不能走 GenerateSpeechFileAsync（文件缓存命中不会触发 GPU 推理）
+                string text = "你好";
+                string spkid = string.IsNullOrWhiteSpace(Configuration?.ReferenceAudio)
+                    ? "女主持"
+                    : Configuration!.ReferenceAudio!.Trim();
+                float speed = Configuration!.Speed <= 0 ? 1.0f : Configuration.Speed;
+                string instruct = Configuration.Instruct?.Trim() ?? "";
+                // 独立输出文件（不参与同句缓存查找），每次预热覆盖重合成
+                string outputPath = Path.Combine(AlifePath.TempFolderPath, "cosy_warmup.wav");
+                string hash = ComputeHash(text, spkid, speed, instruct) + "_warmup";
+                string? path = await SynthesizeCoreAsync(
+                    text, spkid, speed, instruct, outputPath, hash,
+                    new InFlightSynth { Task = Task.FromResult<string?>(null), Waiters = 1 },
+                    CancellationToken.None).ConfigureAwait(false);
                 if (path != null)
                 {
-                    Interlocked.Exchange(ref _lastWarmupUtcTicks, DateTime.UtcNow.Ticks);
+                    CosyVoiceSharedGate.MarkWarmup(Configuration.Port, Configuration.ProjectDir);
                     Log("预热完成");
                 }
                 else
@@ -1252,11 +1325,29 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         {
             if (config == null) return;
             string expected = $"http://127.0.0.1:{config.Port}";
-            if (string.IsNullOrWhiteSpace(config.ApiUrl) ||
-                config.ApiUrl.Contains("127.0.0.1") ||
-                config.ApiUrl.Contains("localhost"))
+
+            if (string.IsNullOrWhiteSpace(config.ApiUrl))
             {
                 config.ApiUrl = expected;
+                return;
+            }
+
+            string url = config.ApiUrl.Trim();
+            if (url.Contains("127.0.0.1") || url.Contains("localhost"))
+            {
+                // 仅同步「纯本地根地址」（与端口保持一致）；带路径/查询的自定义地址（如反代子路径）不碰
+                bool hasPath;
+                try
+                {
+                    var u = new Uri(url);
+                    hasPath = u.AbsolutePath.TrimEnd('/').Length > 0 || u.Query.Length > 0;
+                }
+                catch
+                {
+                    hasPath = true; // 解析失败：宁可不动用户配置
+                }
+                if (!hasPath)
+                    config.ApiUrl = expected;
             }
         }
 
@@ -1294,11 +1385,72 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             return true;
         }
 
+        /// <summary>
+        /// 清理过期的同句缓存 wav：先按年龄删（CacheMaxAgeHours），再按条数上限删最旧（CacheMaxFiles），
+        /// 并同步修剪内存缓存表中指向已删文件的项。由看门狗每小时调用一次。
+        /// </summary>
+        private void SweepCache()
+        {
+            try
+            {
+                int maxAgeHours = Math.Max(0, Configuration?.CacheMaxAgeHours ?? 72);
+                int maxFiles = Math.Max(0, Configuration?.CacheMaxFiles ?? 300);
+                if (maxAgeHours == 0 && maxFiles == 0)
+                    return;
+
+                string dir = AlifePath.TempFolderPath;
+                if (!Directory.Exists(dir))
+                    return;
+
+                var files = new List<FileInfo>();
+                foreach (string raw in Directory.EnumerateFiles(dir, "cosy_*.wav"))
+                {
+                    try { files.Add(new FileInfo(raw)); } catch { /* ignore */ }
+                }
+
+                int removed = 0;
+                if (maxAgeHours > 0)
+                {
+                    var cutoff = DateTime.UtcNow - TimeSpan.FromHours(maxAgeHours);
+                    foreach (FileInfo f in files.ToList())
+                    {
+                        if (f.LastWriteTimeUtc >= cutoff) continue;
+                        try { f.Delete(); files.Remove(f); removed++; } catch { /* ignore */ }
+                    }
+                }
+
+                if (maxFiles > 0 && files.Count > maxFiles)
+                {
+                    foreach (FileInfo f in files
+                        .OrderBy(f => f.LastWriteTimeUtc)
+                        .Take(files.Count - maxFiles))
+                    {
+                        try { f.Delete(); removed++; } catch { /* ignore */ }
+                    }
+                }
+
+                if (removed > 0)
+                {
+                    // 修剪指向已删文件的内存缓存项
+                    foreach (var kv in FileCache)
+                    {
+                        if (!File.Exists(kv.Value))
+                            FileCache.TryRemove(kv.Key, out _);
+                    }
+                    LogImportant($"缓存清理：删除 {removed} 个过期 wav");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"缓存清理失败：{ex.Message}");
+            }
+        }
+
         private static string ComputeHash(
-            string text, string spkid, float speed, string instruct, string api)
+            string text, string spkid, float speed, string instruct)
         {
             using var md5 = MD5.Create();
-            var raw = $"{text}|{spkid}|{speed:F2}|{instruct}|{api}";
+            var raw = $"{text}|{spkid}|{speed:F2}|{instruct}";
             return Convert.ToHexString(md5.ComputeHash(Encoding.UTF8.GetBytes(raw)));
         }
 
@@ -1497,6 +1649,27 @@ namespace Alife.Function.Speech.CosyVoiceTTS
             }
         }
 
+        /// <summary>获取当前进程工作集字节数；无进程或失败返回 0。</summary>
+        public long GetWorkingSetSize()
+        {
+            lock (_lock)
+            {
+                if (_process == null)
+                    return 0;
+                try
+                {
+                    if (_process.HasExited)
+                        return 0;
+                    _process.Refresh();
+                    return _process.WorkingSet64;
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+        }
+
         /// <param name="bindJob">
         /// true=绑定 KillOnClose Job（独占）；false=共享模式不绑，避免一个桌宠退出带走 TTS。
         /// </param>
@@ -1585,8 +1758,10 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     if (string.IsNullOrEmpty(e.Data)) return;
                     lock (_stderr)
                     {
-                        if (_stderr.Length < 4000)
-                            _stderr.AppendLine(e.Data);
+                        // 只保留末尾：异常退出时 Traceback 的结尾（根因所在）最关键
+                        _stderr.AppendLine(e.Data);
+                        if (_stderr.Length > 8000)
+                            _stderr.Remove(0, _stderr.Length - 4000);
                     }
                 };
                 _process.Exited += (_, _) =>
@@ -1766,7 +1941,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 try { if (File.Exists(PidFilePath)) File.Delete(PidFilePath); } catch { }
             }
 
-            // 3) 按端口查杀（解决 PID 文件丢失 / 进程树残留）
+            // 3) 按端口查杀（解决 PID 文件丢失 / 进程树残留）；KillProcessTree 内部已含 taskkill 兜底
             foreach (int port in new[] { _config.Port, _config.WebPort }.Distinct())
             {
                 if (port <= 0) continue;
@@ -1778,17 +1953,20 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                 }
             }
 
-            // 4) 兜底：taskkill 再扫一遍端口占用
-            foreach (int port in new[] { _config.Port, _config.WebPort }.Distinct())
+            // 4) 兜底：端口仍被占用才再扫一遍（减少 netstat 次数）
+            if (IsPortListening(_config.Port) || IsPortListening(_config.WebPort))
             {
-                if (port <= 0) continue;
-                foreach (int pid in GetPidsListeningOnPort(port))
+                foreach (int port in new[] { _config.Port, _config.WebPort }.Distinct())
                 {
-                    if (killed.Contains(pid)) continue;
-                    if (TaskKill(pid))
+                    if (port <= 0) continue;
+                    foreach (int pid in GetPidsListeningOnPort(port))
                     {
-                        killed.Add(pid);
-                        killCount++;
+                        if (killed.Contains(pid)) continue;
+                        if (TaskKill(pid))
+                        {
+                            killed.Add(pid);
+                            killCount++;
+                        }
                     }
                 }
             }
@@ -2419,6 +2597,46 @@ namespace Alife.Function.Speech.CosyVoiceTTS
                     File.WriteAllText(_synthBusyFile, $"{Environment.ProcessId}|{DateTime.UtcNow:O}");
                 else if (File.Exists(_synthBusyFile))
                     File.Delete(_synthBusyFile);
+            }
+            catch { /* ignore */ }
+        }
+
+        // ===== 预热标记（跨进程共享：多桌宠/多次开启不重复预热）=====
+
+        private static string WarmupStampPath(int port, string? projectDir)
+        {
+            port = port > 0 ? port : 9981;
+            string root = !string.IsNullOrWhiteSpace(projectDir) && Directory.Exists(projectDir)
+                ? projectDir
+                : Path.GetTempPath();
+            return Path.Combine(root, ".cosyvoice_alife_clients", $"p{port}.warmup");
+        }
+
+        /// <summary>最近一次成功预热的 UTC 时间（无标记或读取失败返回 null）。</summary>
+        public static DateTime? GetLastWarmupUtc(int port, string? projectDir)
+        {
+            try
+            {
+                string path = WarmupStampPath(port, projectDir);
+                if (!File.Exists(path)) return null;
+                return long.TryParse(File.ReadAllText(path).Trim(), out long ticks) && ticks > 0
+                    ? new DateTime(ticks, DateTimeKind.Utc)
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>记录本次预热成功时间（写入共享文件，跨进程可见）。</summary>
+        public static void MarkWarmup(int port, string? projectDir)
+        {
+            try
+            {
+                string path = WarmupStampPath(port, projectDir);
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllText(path, DateTime.UtcNow.Ticks.ToString());
             }
             catch { /* ignore */ }
         }
