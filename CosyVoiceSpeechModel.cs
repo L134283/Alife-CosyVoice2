@@ -13,7 +13,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Alife.Framework;
 using Alife.Foundation;
-using Alife.Function.AIModelUtility;
+using Alife.Function.Speech;
 
 namespace Alife.Function.Speech.CosyVoiceTTS
 {
@@ -28,7 +28,7 @@ namespace Alife.Function.Speech.CosyVoiceTTS
         ISpeechModel,
         IConfigurable<CosyVoiceSpeechModelConfig>
     {
-        public CosyVoiceSpeechModelConfig? Configuration { get; set; }
+        public CosyVoiceSpeechModelConfig Configuration { get; set; } = null!;
 
         private static readonly ConcurrentDictionary<string, string> FileCache = new();
         private static readonly ConcurrentDictionary<string, InFlightSynth> InFlight = new();

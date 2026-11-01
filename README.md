@@ -2,7 +2,8 @@
 
 基于本地 **CosyVoice2（yinmei）** 的 Alife 语音合成插件。由插件自动拉起本地 Python 服务，对接 `ISpeechModel`，供语音输出链路使用。
 
-> 依赖：`Alife.Function.AIModelUtility`（提供 `ISpeechModel` 接口，4.0 起由 `Alife.Function.Speech` 消费）  
+> 依赖：`Alife.Function.Speech`（5.0 起提供 `ISpeechModel` 接口并负责播放；4.x 时代该接口在 `Alife.Function.AIModelUtility`）  
+> 客户端：需 Alife **5.x**（插件主版本号须与客户端一致）
 > 本地服务：yinmei-cosyvoice（需自行安装模型与 Python 环境）
 
 ## 功能
@@ -122,7 +123,7 @@ Cosy 服务对纯标点 / 空白（如 `...`、`！！！`、`——`）会稳�
 
 ## 依赖与环境
 
-- **Alife 依赖**：`Alife.Function.AIModelUtility`（提供 `ISpeechModel`；4.0 起语音播放由 `Alife.Function.Speech` 消费）
+- **Alife 依赖**：`Alife.Function.Speech`（提供 `ISpeechModel` 与语音播放，客户端须为 5.x）
 - **本机环境**（不由插件 pip 安装）：
   - yinmei-cosyvoice 项目
   - 对应 Python 解释器
@@ -151,6 +152,13 @@ Python：D:\1TTS\yinmei-cosyvoice\python311\python.exe
 | **关** | 额外输出合成过程、锁等待、预热、健康检查细节等 |
 
 ## 版本
+
+### v5.0.0
+
+- **适配 Alife 5.0 框架**：`ISpeechModel` 接口从 `Alife.Function.AIModelUtility` 迁移到 `Alife.Function.Speech`，插件清单依赖与命名空间同步更新（未改依赖会导致编译报 `CS0246`，即 4.1.5 在 5.x 客户端上「插件失效」的根因）
+- **配置属性对齐 5.x 契约**：`IConfigurable<T>.Configuration` 已去可空，改为非空声明（框架在构造后立即注入）
+- **版本号提升到 5.x**：插件主版本号须与客户端主版本号一致，4.1.5 及更早版本请继续在 4.x 客户端使用
+- 功能与 v4.1.5 完全一致，仅框架适配
 
 ### v4.1.5
 

@@ -1,6 +1,6 @@
 {
-  "Version": "4.1.5",
+  "Version": "5.0.0",
   "Dependencies": {
-    "Alife.Function.AIModelUtility": ""
+    "Alife.Function.Speech": ""
   }
 }
